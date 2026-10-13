@@ -104,6 +104,10 @@ function setup(mode: string, ios = true) {
     lateTap: null,
     resetInputSentinel: () => {},
     resetKeyboard: () => {},
+    unmuteOnInteraction: () => {},
+    $emit: () => {},
+    controlling: true,
+    locked: false,
     $client: { sendData: () => {} },
   }
   for (const [key, value] of Object.entries(state)) {
@@ -235,6 +239,20 @@ describe('tap keyboard on iOS', () => {
     t.advance(800)
     expect(t.ctx.keyboardOpen).toBe(false)
     expect(t.ctx.textSpot).toBe(null)
+  })
+
+  test('a scroll started before the cursor arrives drops the tap', () => {
+    const t = setup('auto')
+    t.tap(field)
+    t.advance(50)
+    t.ctx.onGestureBegin(blank)
+    expect(t.events).toEqual(['focus:none', 'blur'])
+    t.advance(100)
+    t.cursor('text')
+    t.advance(2000)
+    expect(t.ctx.keyboardOpen).toBe(false)
+    expect(t.doc.activeElement).toBe(null)
+    expect(t.ctx.typeChip).toBe(null)
   })
 
   test('falls back to the chip when the focus could not be held', () => {

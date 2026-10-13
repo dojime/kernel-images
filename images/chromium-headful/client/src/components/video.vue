@@ -1066,7 +1066,7 @@
     onGestureBegin(p: Point) {
       this.unmuteOnInteraction()
       this.hideTypeChip()
-      this.lateTap = null
+      this.cancelPendingTap()
       if (this._controls) this._controls.wake()
       this.touchBeganAt = performance.now()
 
@@ -1216,9 +1216,7 @@
     // focused now with inputmode="none", which shows no keyboard, and removing
     // inputmode later raises it.
     keyboardAfterTap(p: Point) {
-      window.clearTimeout(this.pendingTapTimer)
-      this.pendingTap = null
-      this.lateTap = null
+      this.cancelPendingTap()
 
       if (this.tapKeyboard === 'off') return
       if (this.tapKeyboard === 'always') {
@@ -1244,6 +1242,15 @@
       // within the window counts; only the end of the window means "not text".
       this.pendingTap = { p, here, at: performance.now() }
       this.pendingTapTimer = window.setTimeout(this.endPendingTap, CURSOR_WAIT_MS)
+    }
+
+    // A new touch ends the wait for the previous tap's cursor, so it cannot
+    // raise the keyboard during a scroll, pinch or drag.
+    cancelPendingTap() {
+      window.clearTimeout(this.pendingTapTimer)
+      this.pendingTap = null
+      this.lateTap = null
+      if (this.focusHeld) this._overlay.blur()
     }
 
     // whether a tap lands where a text cursor was seen, measured on screen
