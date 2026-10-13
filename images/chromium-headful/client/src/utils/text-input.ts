@@ -28,6 +28,13 @@ export function keysymNeedsShift(keysym: number) {
   return false
 }
 
+// iOS (every browser there is WebKit) raises the soft keyboard only for focus()
+// inside a user gesture handler. Other mobile browsers also raise it for a
+// later focus() once the page has had a user gesture.
+export function focusNeedsGesture(nav: { userAgent: string; platform: string; maxTouchPoints: number }) {
+  return /iPad|iPhone|iPod/.test(nav.userAgent) || (nav.platform === 'MacIntel' && nav.maxTouchPoints > 1)
+}
+
 // Minimal edit that turns prev into next: delete from the end, then insert.
 export function textDiff(prev: string, next: string) {
   const a = Array.from(prev)

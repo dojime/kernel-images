@@ -313,6 +313,7 @@
     XK_RETURN,
     XK_SHIFT_L,
     charToKeysym,
+    focusNeedsGesture,
     keysymNeedsShift,
     needsShift,
     textDiff,
@@ -334,10 +335,14 @@
   const TOUCH_SCROLL_UNITS_PER_PX = 1.1
   const DOUBLE_TAP_MS = 300
   const DOUBLE_TAP_SLOP = 40
-  // how long after a tap a text cursor can still offer the keyboard
+  // how long after a tap a text cursor can still raise the keyboard
   const CURSOR_WAIT_MS = 800
-  // a tap this close (remote px) to where a text cursor was seen raises the keyboard
+  // a text cursor later than CURSOR_WAIT_MS but within this offers the "Tap to type" button
+  const CURSOR_LATE_MS = 2000
+  // remote px; pointer positions this close are the same spot
   const CURSOR_SAME_SPOT = 16
+  // a tap this close (CSS px on screen) to where a text cursor was seen raises the keyboard
+  const TEXT_SPOT_RADIUS = 12
   const TYPE_CHIP_MS = 4000
   // kept in the overlay so soft keyboards that only emit input events still report backspace
   const INPUT_SENTINEL = ' '
@@ -414,6 +419,9 @@
     private lastTap: { p: Point; at: number } | null = null
     private pendingTap: { p: Point; here: Point; at: number } | null = null
     private pendingTapTimer = 0
+    private lateTap: { p: Point; at: number } | null = null
+    // the overlay is focused with inputmode="none" while a tap waits for the cursor
+    private focusHeld = false
     private scrollRemainder = { x: 0, y: 0 }
     private composing = false
     private composed = ''
@@ -563,6 +571,10 @@
     get tapKeyboard(): TapKeyboardMode {
       const value = new URL(location.href).searchParams.get('tapKeyboard')
       return value === 'chip' || value === 'always' || value === 'off' ? value : 'auto'
+    }
+
+    get focusNeedsGesture() {
+      return focusNeedsGesture(navigator)
     }
 
     @Watch('width')
@@ -1054,6 +1066,7 @@
     onGestureBegin(p: Point) {
       this.unmuteOnInteraction()
       this.hideTypeChip()
+      this.lateTap = null
       if (this._controls) this._controls.wake()
       this.touchBeganAt = performance.now()
 
@@ -1193,16 +1206,19 @@
       this.applyZoom(true)
     }
 
-    // Runs inside touchend, the only place iOS lets focus() raise the keyboard.
-    // The remote cursor shape is the signal: Chromium shows an I-beam over text
-    // fields (and over selectable page text, which is the false positive), and
-    // the pointer was moved to the tap position on touchstart. Over a real
-    // network the update usually arrives after the finger lifts, so the keyboard
-    // opens here only if a text cursor showed up during this touch or was seen
-    // at this spot before; otherwise a later text cursor offers the chip.
+    // Runs inside touchend. The remote cursor shape is the signal: Chromium
+    // shows an I-beam over text fields (and over selectable page text, which is
+    // the false positive), and the pointer was moved to the tap position on
+    // touchstart. A text cursor that showed up during this touch, or was seen at
+    // this spot before, raises the keyboard here. Otherwise the cursor update
+    // decides, and over a real network it usually arrives after the finger
+    // lifts. iOS ignores focus() outside a gesture, so there the overlay is
+    // focused now with inputmode="none", which shows no keyboard, and removing
+    // inputmode later raises it.
     keyboardAfterTap(p: Point) {
       window.clearTimeout(this.pendingTapTimer)
       this.pendingTap = null
+      this.lateTap = null
 
       if (this.tapKeyboard === 'off') return
       if (this.tapKeyboard === 'always') {
@@ -1211,10 +1227,17 @@
       }
 
       const here = this.remotePoint(p)
-      const textDuringTouch = this.cursorKind === 'text' && this.cursorChangedAt >= this.touchBeganAt
-      if (textDuringTouch || (this.textSpot && nearSpot(here, this.textSpot))) {
+      if (this.cursorKind === 'text' && this.cursorChangedAt >= this.touchBeganAt) {
         this.offerKeyboard(p, true)
         return
+      }
+      if (this.nearTextSpot(here)) {
+        this.offerKeyboard(p, true)
+        // the tap may still have moved the pointer off the field, which the
+        // end of the window catches
+        if (this.tapKeyboard !== 'auto') return
+      } else if (this.tapKeyboard === 'auto' && !this.keyboardOpen && this.focusNeedsGesture) {
+        this.holdFocus()
       }
 
       // Pages often flash another cursor before the I-beam, so any text cursor
@@ -1223,9 +1246,17 @@
       this.pendingTapTimer = window.setTimeout(this.endPendingTap, CURSOR_WAIT_MS)
     }
 
+    // whether a tap lands where a text cursor was seen, measured on screen
+    nearTextSpot(here: Point) {
+      if (!this.textSpot) return false
+      const remotePerClient = this.$accessor.video.resolution.w / this._overlay.getBoundingClientRect().width
+      const radius = Math.max(CURSOR_SAME_SPOT, TEXT_SPOT_RADIUS * remotePerClient)
+      return Math.hypot(here.x - this.textSpot.x, here.y - this.textSpot.y) <= radius
+    }
+
     offerKeyboard(p: Point, inGesture: boolean) {
       if (this.keyboardOpen) return
-      if (inGesture && this.tapKeyboard === 'auto') {
+      if (this.tapKeyboard === 'auto' && (inGesture || this.focusHeld || !this.focusNeedsGesture)) {
         this.focusForTyping()
       } else {
         this.showTypeChip(p)
@@ -1244,8 +1275,9 @@
         this.offerKeyboard(tap.p, false)
         return
       }
-      if (this.textSpot && nearSpot(tap.here, this.textSpot)) this.textSpot = null
-      if (this.keyboardOpen) this._overlay.blur()
+      if (this.nearTextSpot(tap.here)) this.textSpot = null
+      if (this.tapKeyboard === 'auto') this.lateTap = tap
+      if (this.keyboardOpen || this.focusHeld) this._overlay.blur()
     }
 
     onCursorImage(image: CursorImage) {
@@ -1264,6 +1296,13 @@
           window.clearTimeout(this.pendingTapTimer)
           this.pendingTap = null
           this.offerKeyboard(tap.p, false)
+          return
+        }
+        // too late to raise the keyboard, so offer it at the tap
+        const late = this.lateTap
+        if (late && performance.now() - late.at < CURSOR_LATE_MS) {
+          this.lateTap = null
+          if (!this.keyboardOpen) this.showTypeChip(late.p)
         }
       }
 
@@ -1297,7 +1336,27 @@
 
     focusForTyping() {
       this.resetInputSentinel()
+      this._overlay.removeAttribute('inputmode')
+      if (this.focusHeld) {
+        this.focusHeld = false
+        this.onOverlayFocus()
+      } else {
+        this._overlay.focus({ preventScroll: true })
+      }
+    }
+
+    // Focuses the overlay inside the tap without showing the keyboard. iOS
+    // raises the keyboard when inputmode="none" is removed from an element that
+    // was focused inside a gesture, so a text cursor that arrives after the
+    // finger lifts can still open it.
+    holdFocus() {
+      this._overlay.setAttribute('inputmode', 'none')
+      this.focusHeld = true
       this._overlay.focus({ preventScroll: true })
+      if (document.activeElement !== this._overlay) {
+        this.focusHeld = false
+        this._overlay.removeAttribute('inputmode')
+      }
     }
 
     // iOS overlays the soft keyboard on the layout viewport instead of resizing
@@ -1542,6 +1601,7 @@
     }
 
     onOverlayFocus() {
+      if (this.focusHeld) return
       this.keyboardOpen = true
       if (this.hosting) {
         this.syncClipboard()
@@ -1549,6 +1609,8 @@
     }
 
     onOverlayBlur() {
+      this.focusHeld = false
+      this._overlay.removeAttribute('inputmode')
       this.keyboardOpen = false
       this.resetKeyboard()
     }
