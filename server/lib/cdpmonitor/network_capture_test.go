@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kernel/kernel-images/server/lib/browsersurface"
 	"github.com/kernel/kernel-images/server/lib/cdpclient"
+	"github.com/kernel/kernel-images/server/lib/events"
 	"github.com/kernel/kernel-images/server/lib/oapi"
 	"github.com/stretchr/testify/require"
 )
@@ -74,6 +76,99 @@ func TestNetworkHeadersFollowRedirectHops(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTerminalRequestPreservesPendingRedirectHeaders(t *testing.T) {
+	for _, terminal := range []string{EventNetworkLoadingFailed, EventNetworkResponse} {
+		t.Run(terminal, func(t *testing.T) {
+			srv := newTestServer(t)
+			defer srv.close()
+			m, ec, cleanup := startMonitor(t, srv, nil)
+			defer cleanup()
+			send := func(method string, params any) { sendNetworkFixture(t, srv, method, params) }
+			send("Network.requestWillBeSent", cdpNetworkRequestWillBeSentParams{RequestID: "r", Request: cdpNetworkRequest{Method: "GET", URL: "https://example.com/start"}})
+			send("Network.requestWillBeSentExtraInfo", cdpNetworkRequestWillBeSentExtraInfoParams{RequestID: "r", Headers: json.RawMessage(`{"Cookie":"hop=0"}`)})
+			send("Network.requestWillBeSent", cdpNetworkRequestWillBeSentParams{RequestID: "r", RedirectHasExtraInfo: true, RedirectResponse: json.RawMessage(`{"status":302,"headers":{"Base":"redirect"}}`), Request: cdpNetworkRequest{Method: "GET", URL: "https://example.com/final"}})
+			if terminal == EventNetworkLoadingFailed {
+				send("Network.requestWillBeSentExtraInfo", cdpNetworkRequestWillBeSentExtraInfoParams{RequestID: "r", Headers: json.RawMessage(`{"Cookie":"hop=1"}`)})
+				send("Network.loadingFailed", cdpNetworkLoadingFailedParams{RequestID: "r", ErrorText: "net::ERR_ABORTED", Canceled: true})
+			} else {
+				// A cached final response can finish before the redirect's ExtraInfo arrives.
+				send("Network.responseReceived", cdpNetworkResponseReceivedParams{RequestID: "r", Response: cdpNetworkResponse{Status: 200}})
+				send("Network.loadingFinished", cdpNetworkLoadingFinishedParams{RequestID: "r"})
+			}
+			waitForNetworkURL(t, ec, EventNetworkRequest, "https://example.com/final")
+			if terminal == EventNetworkLoadingFailed {
+				waitForNetworkURL(t, ec, terminal, "https://example.com/final")
+			}
+			send("Network.responseReceivedExtraInfo", cdpNetworkResponseReceivedExtraInfoParams{RequestID: "r", StatusCode: 302, Headers: json.RawMessage(`{"Set-Cookie":"redirect=true","X-Wire":"yes"}`)})
+			event := waitForNetworkURL(t, ec, EventNetworkResponse, "https://example.com/start")
+			var response oapi.BrowserNetworkResponseEventData
+			require.NoError(t, json.Unmarshal(event.Data, &response))
+			require.Equal(t, "redirect=true", response.Headers["Set-Cookie"])
+			require.Equal(t, "yes", response.Headers["X-Wire"])
+			waitForNetworkURL(t, ec, terminal, "https://example.com/final")
+			require.Eventually(t, func() bool {
+				m.pendReqMu.Lock()
+				defer m.pendReqMu.Unlock()
+				return len(m.networkExchanges) == 0
+			}, time.Second, time.Millisecond, "completed captures must release their header state")
+		})
+	}
+}
+
+func TestCanceledRequestPublishesBeforeFailure(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.close()
+	_, ec, cleanup := startMonitor(t, srv, nil)
+	defer cleanup()
+	sendNetworkFixture(t, srv, "Network.requestWillBeSent", cdpNetworkRequestWillBeSentParams{RequestID: "r", Request: cdpNetworkRequest{Method: "GET", URL: "https://example.com/canceled"}})
+	sendNetworkFixture(t, srv, "Network.loadingFailed", cdpNetworkLoadingFailedParams{RequestID: "r", ErrorText: "net::ERR_ABORTED", Canceled: true})
+	request := ec.waitFor(t, EventNetworkRequest, 2*time.Second)
+	failure := ec.waitFor(t, EventNetworkLoadingFailed, 2*time.Second)
+	ec.mu.Lock()
+	defer ec.mu.Unlock()
+	var order []string
+	for _, event := range ec.events {
+		if event.Category == events.Network {
+			order = append(order, event.Type)
+		}
+	}
+	require.Equal(t, []string{EventNetworkRequest, EventNetworkLoadingFailed}, order)
+	require.LessOrEqual(t, request.Ts, failure.Ts)
+}
+
+func TestResponseWaitsForRequestPublication(t *testing.T) {
+	ec := newEventCollector()
+	publish := ec.publishFn()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	m := New(newTestUpstream(""), func(event events.Event) (events.Envelope, bool) {
+		if event.Type == EventNetworkRequest {
+			close(entered)
+			<-release
+		}
+		return publish(event)
+	}, 0, discardLogger, nil)
+	defer m.Stop()
+	defer unblock()
+	m.handleNetworkRequest(cdpNetworkRequestWillBeSentParams{RequestID: "r", Request: cdpNetworkRequest{Method: "GET", URL: "https://example.com/image"}}, "s")
+	m.handleResponseReceived(cdpNetworkResponseReceivedParams{RequestID: "r", Response: cdpNetworkResponse{Status: 200}}, "s")
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("request publication did not start")
+	}
+	m.handleLoadingFinished(context.Background(), cdpNetworkLoadingFinishedParams{RequestID: "r"}, "s")
+	ec.assertNone(t, EventNetworkResponse, 0, 50*time.Millisecond)
+	unblock()
+	ec.waitFor(t, EventNetworkResponse, time.Second)
+	ec.mu.Lock()
+	defer ec.mu.Unlock()
+	require.Len(t, ec.events, 2)
+	require.Equal(t, EventNetworkRequest, ec.events[0].Type)
+	require.Equal(t, EventNetworkResponse, ec.events[1].Type)
 }
 
 func TestNetworkLateHeadersRemainOnResponse(t *testing.T) {
