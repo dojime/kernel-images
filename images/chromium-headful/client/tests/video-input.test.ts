@@ -259,7 +259,14 @@ describe('video with the soft keyboard open', () => {
       playerWidth: 390,
       playerHeight: 664,
       _component: { offsetWidth: 390, offsetHeight: 380, getBoundingClientRect: () => ({ top: 0, bottom: 380 }) },
-      _player: { style, getBoundingClientRect: () => ({ top: -ctx.keyboardPan, height: 664 }) },
+      // mid-transition the on-screen position is neither the old nor the new pan
+      _player: {
+        style,
+        offsetTop: 0,
+        offsetHeight: 664,
+        offsetParent: { getBoundingClientRect: () => ({ top: 0 }) },
+        getBoundingClientRect: () => ({ top: -7, height: 664 }),
+      },
       resetZoom: () => {
         throw new Error('the zoom must survive the keyboard')
       },

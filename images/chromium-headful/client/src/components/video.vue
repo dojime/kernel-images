@@ -1289,17 +1289,19 @@
     // open and moves up to keep the last tap visible, and the keyboard button
     // is lifted by the part of the player still covered.
     updateKeyboardView() {
-      const player = this._player.getBoundingClientRect()
       const area = (!this.fullscreen ? this._component : document.body).getBoundingClientRect()
       const viewport = window.visualViewport
       const visibleTop = viewport ? Math.max(area.top, viewport.offsetTop) : area.top
       const visibleBottom = viewport ? Math.min(area.bottom, viewport.offsetTop + viewport.height) : area.bottom
-      const top = player.top + this.keyboardPan
+      // the layout position, which the pan transform (mid-transition, too) does not move
+      const parent = this._player.offsetParent
+      const top = (parent ? parent.getBoundingClientRect().top : 0) + this._player.offsetTop
+      const height = this._player.offsetHeight
       const pan =
         this.keyboardOpen && this.is_touch_device
           ? keyboardPan({
               top,
-              height: player.height,
+              height,
               anchor: this.keyboardAnchor,
               current: this.keyboardPan,
               visibleTop,
@@ -1310,7 +1312,7 @@
         this.keyboardPan = pan
         this._player.style.transform = pan ? `translateY(${-pan}px)` : ''
       }
-      this.keyboardInset = Math.max(0, Math.round(top + player.height - pan - visibleBottom))
+      this.keyboardInset = Math.max(0, Math.round(top + height - pan - visibleBottom))
     }
 
     toggleMobileKeyboard() {
