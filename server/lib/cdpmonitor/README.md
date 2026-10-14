@@ -64,8 +64,8 @@ startup, telemetry toggles, and shutdown. Additional regressions delay a cleanup
 command while PUT/PATCH/GET continue, fence old capture across coalesced revisions,
 and recover page/frame listeners after socket loss or failed cleanup. They check
 future navigations and the independent user CDP connection as well. Extension
-background pages are included in discovery but are not validated by a real extension
-fixture here. A delayed-Network-reply regression also verifies that pending
+service-worker and page attribution are covered by an unpacked-extension browser
+fixture. A delayed-Network-reply regression also verifies that pending
 attachments finish recovery before optional instrumentation starts, and that
 click events arrive without navigation through subsequent telemetry toggles.
 
@@ -108,6 +108,53 @@ All 32 cases assert successful capture, without prescribing an attachment strate
 and fresh sessions after reconnect. Without the environment variable these tests
 skip, matching the other real-Chromium tests in this package. They exercise settled
 targets, not requests issued before their capture domains finish initializing.
+
+## Network capture fidelity
+
+Top-level navigation retains requests until their terminal events. Only requests
+belonging to the new loader seed its pending count; completions from the previous
+navigation cannot make the new navigation idle. Same-process frame requests still
+participate in their page's network-idle accounting.
+
+The collector joins `requestWillBeSentExtraInfo` and `responseReceivedExtraInfo`
+by session, request ID, and redirect hop. Cached hops without ExtraInfo do not
+consume the next hop's headers. A `network_request` waits at most one second for
+wire headers, then uses the base headers so a hanging request remains visible.
+`network_response.request_headers` retains wire request headers that arrive after
+that initial event. Response capture waits at most one second for promised headers
+before falling back to the base response. Capture remains best-effort when Chrome
+omits events or a target disconnects. Redirects emit a response for each hop,
+without a body. Request IDs remain the same across a redirect chain.
+
+`network_response.status` is the wire status when available. `effective_status`
+is present when Chrome's effective response differs, such as wire 304 with an
+effective 200 and a cached body. `headers` contains the wire response headers when
+available rather than Chrome's merged cache headers.
+
+While optional telemetry is enabled, `Network.enable` requests durable body
+storage with `maxTotalBufferSize` set to 10 MiB on each attached session. Disabling
+telemetry stops new durable capture without disabling the Network domain used by
+counters. Chrome may keep already-buffered bodies until eviction or disconnection.
+Unsupported configuration is logged and ordinary capture continues. Bodies can
+still be evicted under buffer pressure; `body_error` reports retrieval/decoding
+failures separately from intentionally excluded or empty bodies. The 8 KiB/4 KiB
+output caps are unchanged.
+
+Extension-target events carry `source.metadata.extension_id` and
+`source.metadata.kernel_extension` (`"true"` or `"false"`). The latter identifies
+the bundled extensions loaded from their fixed installation paths. Consumers can
+filter these sources while retaining application workers and custom extensions.
+Network events snapshot the request's document origin, falling back to the target
+URL, so navigating into or out of an extension page does not relabel pending
+requests. Content-script requests made through an ordinary page document are not
+attributed to an extension. Attribution is a telemetry aid, not a security boundary.
+
+Run the browser regressions with:
+
+```sh
+KERNEL_CDPMONITOR_CHROME_E2E=1 go test -race ./lib/cdpmonitor \
+  -run '^TestNetwork(WireCapture|BodiesSurviveNavigation|ExtensionAttribution)$' -count=1
+```
 
 ## Event taxonomy
 
@@ -358,7 +405,7 @@ Unless otherwise noted, events also include the nav context fields described abo
 | Event | Fields |
 | --- | --- |
 | `network_request` | `request_id`, `loader_id`, `frame_id`, `document_url`, `method`, `url`, `headers`, `initiator_type`. Optional: `post_data`, `resource_type`, `is_redirect` + `redirect_url`. |
-| `network_response` | `request_id`, `loader_id`, `frame_id`, `method`, `url`, `status`, `headers`. Optional: `status_text`, `mime_type`, `resource_type`, `body` (truncated text body for textual MIME types). |
+| `network_response` | `request_id`, `loader_id`, `frame_id`, `method`, `url`, `status`, `headers`. Optional: `status_text`, `mime_type`, `resource_type`, `body` (truncated text body for textual MIME types), `body_error`, `request_headers`, `effective_status`. |
 | `network_loading_failed` | `request_id`, `error_text`, `canceled`. Optional (absent when the request record was not found): `url`, `loader_id`, `frame_id`, `resource_type`. |
 | `proxy_error` | `request_id`, `code` (typed enum matching the metro header values), `status` (502, or 403 when the session's network policy blocks the destination). Optional: `raw_code` (sanitized original value when `code` is `unknown`), `url`, `loader_id`, `frame_id`, `method`, `resource_type`. Emitted when a 502 or 403 response carries the `X-Kernel-Proxy-Error` header. Unrecognized values are reported as `unknown`; all such values share one rate-limit slot. Emission is sampled to at most one per session+code+resource_type per second. WebSocket handshakes are not classified (documented non-goal). A CONNECT the proxy refuses outright, such as a `network_policy_denied` CONNECT to a port other than 443, is not classified either: Chromium does not expose the refusal, so it appears only as `network_loading_failed` with `net::ERR_TUNNEL_CONNECTION_FAILED`. |
 

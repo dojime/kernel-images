@@ -2459,7 +2459,7 @@ components:
               description: URL of the document that initiated the request.
             headers:
               $ref: "#/components/schemas/BrowserHttpHeaders"
-              description: Request headers.
+              description: Request headers, enriched with wire headers when available before publication.
             resource_type:
               type: string
               description: CDP Network.ResourceType for the request, passed through as-is from Chrome. Known values include Document, Fetch, XHR, Script, Stylesheet, Image, Media, Font, TextTrack, EventSource, WebSocket, Manifest, Prefetch, Other, and more.
@@ -2511,7 +2511,7 @@ components:
               description: HTTP method of the original request.
             status:
               type: integer
-              description: HTTP response status code.
+              description: HTTP response status code on the wire when available, otherwise the effective CDP status.
             status_text:
               type: string
               description: HTTP response status text (e.g. OK, Not Found).
@@ -2524,12 +2524,21 @@ components:
             resource_type:
               type: string
               description: CDP Network.ResourceType for the request, passed through as-is from Chrome. Known values include Document, Fetch, XHR, Script, Stylesheet, Image, Media, Font, TextTrack, EventSource, WebSocket, Manifest, Prefetch, Other, and more.
+            request_headers:
+              $ref: "#/components/schemas/BrowserHttpHeaders"
+              description: Wire request headers when available, including headers that arrived after network_request was published.
+            effective_status:
+              type: integer
+              description: Effective CDP status when different from the wire status, such as 200 for a revalidated 304 response.
             body:
               type: string
               description: Truncated response body, present only for text MIME types.
+            body_error:
+              type: string
+              description: Response body retrieval or decoding error. Absent for successfully retrieved or intentionally excluded bodies.
     BrowserNetworkResponseEvent:
       type: object
-      description: A browser network response received event. Fired after the response body is fully received, not when headers arrive.
+      description: A browser network response received event. Fired after the response body is fully received, or when a redirect advances to the next request.
       required: [ts, type, category, source]
       properties:
         ts:
