@@ -116,6 +116,11 @@ export class TextInput {
     }
   }
 
+  // pasted text, without the line break copied text often ends with
+  paste(text: string) {
+    this.type(text.replace(/[\r\n]+$/, ''))
+  }
+
   compositionStart() {
     this.composing = true
     this.composed = ''

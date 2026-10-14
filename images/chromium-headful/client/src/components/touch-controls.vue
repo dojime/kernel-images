@@ -1,23 +1,37 @@
 <template>
   <div class="touch-controls">
-    <button
+    <div
       ref="control"
       class="keyboard-control"
-      data-role="keyboard-toggle"
       :class="[`mode-${mode}`, { dragging: !!dragPoint, faded, open: keyboardOpen }]"
       :style="controlStyle"
-      :aria-label="keyboardOpen ? 'Hide keyboard' : 'Keyboard'"
       @touchstart.stop.prevent="onTouchStart"
       @touchmove.stop.prevent="onTouchMove"
       @touchend.stop.prevent="onTouchEnd"
       @touchcancel.stop.prevent="onTouchCancel"
       @mousedown.prevent
-      @click.stop.prevent="toggle"
     >
-      <i class="fas fa-keyboard" />
-      <span v-if="mode === 'bottom'">{{ keyboardOpen ? 'Hide keyboard' : 'Keyboard' }}</span>
-      <span v-else-if="keyboardOpen" class="short">Hide</span>
-    </button>
+      <button
+        class="control-button"
+        data-role="keyboard-toggle"
+        :aria-label="keyboardOpen ? 'Hide keyboard' : 'Keyboard'"
+        @click.stop.prevent="run('toggle')"
+      >
+        <i class="fas fa-keyboard" />
+        <span v-if="mode === 'bottom'">{{ keyboardOpen ? 'Hide keyboard' : 'Keyboard' }}</span>
+        <span v-else-if="keyboardOpen" class="short">Hide</span>
+      </button>
+      <button
+        v-if="keyboardOpen"
+        class="control-button"
+        data-role="paste"
+        aria-label="Paste"
+        @click.stop.prevent="run('paste')"
+      >
+        <i class="fas fa-paste" />
+        <span :class="{ short: mode !== 'bottom' }">Paste</span>
+      </button>
+    </div>
   </div>
 </template>
 
@@ -35,13 +49,8 @@
   .keyboard-control {
     position: absolute;
     display: flex;
-    align-items: center;
+    align-items: stretch;
     justify-content: center;
-    gap: 8px;
-    min-width: 44px;
-    min-height: 44px;
-    padding: 0 12px;
-    border: 0;
     border-radius: 22px;
     background: rgba($color: #000, $alpha: 0.7);
     color: #fff;
@@ -58,12 +67,36 @@
       transition: opacity 300ms ease;
     }
 
-    // in a side strip the button is only as wide as the strip
+    .control-button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-width: 44px;
+      min-height: 44px;
+      padding: 0 12px;
+      border: 0;
+      background: none;
+      color: inherit;
+      font: inherit;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    // over the stream and in a side strip the buttons stack, as narrow as the strip
+    &.mode-left,
+    &.mode-right,
+    &.mode-overlay {
+      flex-direction: column;
+    }
+
     &.mode-left,
     &.mode-right {
-      flex-direction: column;
-      gap: 2px;
-      padding: 6px 0;
+      .control-button {
+        flex-direction: column;
+        gap: 2px;
+        padding: 6px 0;
+      }
 
       .short {
         font-size: 10px;
@@ -93,6 +126,8 @@
     placeControl,
   } from '~/utils/touch-controls'
 
+  type ControlAction = 'toggle' | 'paste'
+
   const IDLE_FADE_MS = 3000
   const DRAG_SLOP = 6
 
@@ -117,6 +152,8 @@
     private faded = false
     private fadeTimer = 0
     private touchStart: Point | null = null
+    // the button a touch started on
+    private touchAction: ControlAction = 'toggle'
     // over the stream a faded control is easy to hit by accident, so its first touch only wakes it
     private wakeOnly = false
     // finger offset from the control's top-left corner, so a drag does not jump
@@ -178,9 +215,9 @@
       }, IDLE_FADE_MS)
     }
 
-    toggle() {
+    run(action: ControlAction) {
       this.wake()
-      this.$emit('toggle')
+      this.$emit(action)
     }
 
     localPoint(t: Touch): Point {
@@ -189,6 +226,8 @@
     }
 
     onTouchStart(e: TouchEvent) {
+      const button = (e.target as Element).closest('[data-role]')
+      this.touchAction = button && button.getAttribute('data-role') === 'paste' ? 'paste' : 'toggle'
       this.wakeOnly = this.faded && this.mode === 'overlay'
       this.wake()
       const p = this.localPoint(e.changedTouches[0])
@@ -204,11 +243,11 @@
       this.dragPoint = p
     }
 
-    // runs inside touchend, so a tap can still raise the soft keyboard
+    // runs inside touchend, so a tap can still raise the soft keyboard or read the clipboard
     onTouchEnd() {
       if (!this.dragPoint) {
         this.touchStart = null
-        if (!this.wakeOnly) this.toggle()
+        if (!this.wakeOnly) this.run(this.touchAction)
         return
       }
 

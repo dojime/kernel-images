@@ -147,6 +147,13 @@ describe('soft keyboard text', () => {
     expect(remote.text).toBe('aa')
   })
 
+  test('types pasted text without its trailing line break', () => {
+    const { input, remote } = setup()
+    input.paste('Pass Word\n2\n')
+    expect(remote.text).toBe('Pass Word\n2')
+    expect(remote.keys.slice(0, 2)).toEqual([XK_SHIFT_L, 0x50])
+  })
+
   test('drops composed text while input is disabled', () => {
     const { input, remote } = setup()
     input.compositionStart()

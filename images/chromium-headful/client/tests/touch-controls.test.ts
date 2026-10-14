@@ -120,9 +120,11 @@ describe('keyboard control', () => {
       wake: () => (ctx.faded = false),
       $emit: (name: string) => emitted.push(name),
     }
-    ctx.toggle = () => methods.toggle.call(ctx)
-    const tap = () => {
-      methods.onTouchStart.call(ctx, { changedTouches: [{}] })
+    ctx.run = (action: string) => methods.run.call(ctx, action)
+    // role: the button the finger lands on
+    const tap = (role = 'keyboard-toggle') => {
+      const button = { getAttribute: () => role }
+      methods.onTouchStart.call(ctx, { changedTouches: [{}], target: { closest: () => button } })
       methods.onTouchEnd.call(ctx)
     }
     return { ctx, emitted, tap }
@@ -141,5 +143,17 @@ describe('keyboard control', () => {
     const { emitted, tap } = control('bottom')
     tap()
     expect(emitted).toEqual(['toggle'])
+  })
+
+  test('a tap on the paste button pastes, and its first touch over the stream also only wakes it', () => {
+    const band = control('bottom')
+    band.tap('paste')
+    expect(band.emitted).toEqual(['paste'])
+
+    const overlay = control('overlay')
+    overlay.tap('paste')
+    expect(overlay.emitted).toEqual([])
+    overlay.tap('paste')
+    expect(overlay.emitted).toEqual(['paste'])
   })
 })
