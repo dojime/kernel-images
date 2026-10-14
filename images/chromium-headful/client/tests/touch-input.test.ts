@@ -373,6 +373,30 @@ describe('touch gestures', () => {
     }
   })
 
+  test('cancel releases a drag once and delivers nothing after it', () => {
+    const time = fakeTime()
+    try {
+      const { calls, handlers } = recorder()
+      const g = new TouchGestures(handlers)
+      g.touchStart(event(0, { x: 50, y: 60 }))
+      time.advance(500)
+      g.touchMove(event(520, { x: 80, y: 60 }))
+      g.cancel()
+      g.touchMove(event(540, { x: 120, y: 60 }))
+      g.touchEnd(event(600))
+      expect(calls.map((c) => c.split(' ')[0])).toEqual([
+        'onTouchBegin',
+        'onLongPress',
+        'onDragStart',
+        'onDragMove',
+        'onDragEnd',
+      ])
+      expect(calls[calls.length - 1]).toBe('onDragEnd [{"x":80,"y":60}]')
+    } finally {
+      time.restore()
+    }
+  })
+
   test('a cancelled touch can still pinch', () => {
     const { calls, handlers } = recorder()
     const g = new TouchGestures(handlers)

@@ -178,11 +178,12 @@ export class TouchGestures {
     this.mode = 'idle'
   }
 
-  // Ends the page's part of the current gesture, including a fling, without
-  // calling any more handlers for it. A pinch carries on.
+  // Ends the page's part of the current gesture, including a fling. A drag
+  // still releases its button; nothing else is delivered. A pinch carries on.
   cancel() {
     this.clearLongPress()
     this.stopFling()
+    if (this.mode === 'drag') this.handlers.onDragEnd(this.last)
     if (this.mode !== 'idle' && this.mode !== 'pinch') this.mode = 'passive'
   }
 
