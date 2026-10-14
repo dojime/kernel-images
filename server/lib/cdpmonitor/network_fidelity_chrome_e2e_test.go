@@ -293,3 +293,41 @@ func TestNetworkExtensionAttribution(t *testing.T) {
 		}
 	}
 }
+
+func TestNetworkBundledExtensionAttribution(t *testing.T) {
+	dir := os.Getenv("KERNEL_CDPMONITOR_BUNDLED_EXTENSION_PATH")
+	if dir == "" {
+		t.Skip("set KERNEL_CDPMONITOR_BUNDLED_EXTENSION_PATH to a bundled extension at its installed path")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"from":"bundled-extension"}`)
+	}))
+	defer stub.Close()
+	ws := launchChromium(t, ctx, findChromium(t), "--enable-unsafe-extension-debugging")
+	c, err := cdpclient.Dial(ctx, ws)
+	require.NoError(t, err)
+	defer c.Close()
+	extensionID, err := c.LoadUnpackedExtension(ctx, dir)
+	require.NoError(t, err)
+	t.Logf("Chromium loaded %s as %s", dir, extensionID)
+	driver := dialCDP(t, ctx, ws)
+	defer driver.close()
+	target := driver.call(t, ctx, "", "Target.createTarget", map[string]any{"url": "chrome-extension://" + extensionID + "/manifest.json"}).targetID(t)
+	session := driver.call(t, ctx, "", "Target.attachToTarget", map[string]any{"targetId": target, "flatten": true}).sessionID(t)
+	ec := newEventCollector()
+	m := New(&staticUpstream{url: ws}, ec.publishFn(), 99, discardLogger, nil)
+	require.NoError(t, m.Start(ctx))
+	defer m.Stop()
+	require.Eventually(t, func() bool {
+		return driver.evalBool(ctx, session, fmt.Sprintf(`location.hostname === %q && window.__kernelEventInjected === true`, extensionID))
+	}, 5*time.Second, 20*time.Millisecond)
+	evaluateNetworkScript(t, ctx, driver, session, fmt.Sprintf(`fetch(%q).then(r=>r.json())`, stub.URL+"/bundled-api"))
+	for _, typ := range []string{EventNetworkRequest, EventNetworkResponse} {
+		event := waitForNetworkURL(t, ec, typ, stub.URL+"/bundled-api")
+		require.Equal(t, extensionID, (*event.Source.Metadata)["extension_id"])
+		require.Equal(t, "true", (*event.Source.Metadata)["kernel_extension"])
+	}
+}

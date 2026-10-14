@@ -203,6 +203,59 @@ func TestNetworkLateHeadersRemainOnResponse(t *testing.T) {
 	require.Equal(t, 1, count, "late headers must not duplicate the request event")
 }
 
+func TestNetworkMalformedWireHeadersPreserveBaseHeaders(t *testing.T) {
+	for _, wire := range []string{`[]`, `"invalid"`, `null`} {
+		t.Run(wire, func(t *testing.T) {
+			srv := newTestServer(t)
+			defer srv.close()
+			_, ec, cleanup := startMonitor(t, srv, nil)
+			defer cleanup()
+			sendNetworkFixture(t, srv, "Network.requestWillBeSent", cdpNetworkRequestWillBeSentParams{RequestID: "r", Request: cdpNetworkRequest{Method: "GET", URL: "https://example.com/", Headers: json.RawMessage(`{"X-Request":"base"}`)}})
+			sendNetworkFixture(t, srv, "Network.requestWillBeSentExtraInfo", cdpNetworkRequestWillBeSentExtraInfoParams{RequestID: "r", Headers: json.RawMessage(wire)})
+			sendNetworkFixture(t, srv, "Network.responseReceived", cdpNetworkResponseReceivedParams{RequestID: "r", HasExtraInfo: true, Response: cdpNetworkResponse{Status: 200, Headers: json.RawMessage(`{"X-Response":"base"}`)}})
+			sendNetworkFixture(t, srv, "Network.responseReceivedExtraInfo", cdpNetworkResponseReceivedExtraInfoParams{RequestID: "r", StatusCode: 200, Headers: json.RawMessage(wire)})
+			sendNetworkFixture(t, srv, "Network.loadingFinished", cdpNetworkLoadingFinishedParams{RequestID: "r"})
+			var request oapi.BrowserNetworkRequestEventData
+			require.NoError(t, json.Unmarshal(ec.waitFor(t, EventNetworkRequest, time.Second).Data, &request))
+			require.Equal(t, "base", request.Headers["X-Request"])
+			var response oapi.BrowserNetworkResponseEventData
+			require.NoError(t, json.Unmarshal(ec.waitFor(t, EventNetworkResponse, time.Second).Data, &response))
+			require.Equal(t, "base", response.Headers["X-Response"])
+			require.Nil(t, response.RequestHeaders, "invalid wire headers must not be exposed as captured headers")
+		})
+	}
+}
+
+func TestNetworkWireStatusPreservesEffectiveStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		wireStatus int
+		statusText string
+		effective  *int
+	}{
+		{"revalidated", 304, "Not Modified", ptrOf(200)},
+		{"unchanged", 200, "Custom OK", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			defer srv.close()
+			_, ec, cleanup := startMonitor(t, srv, nil)
+			defer cleanup()
+			sendNetworkFixture(t, srv, "Network.requestWillBeSent", cdpNetworkRequestWillBeSentParams{RequestID: "r", Request: cdpNetworkRequest{Method: "GET", URL: "https://example.com/"}})
+			sendNetworkFixture(t, srv, "Network.requestWillBeSentExtraInfo", cdpNetworkRequestWillBeSentExtraInfoParams{RequestID: "r", Headers: json.RawMessage(`{}`)})
+			sendNetworkFixture(t, srv, "Network.responseReceived", cdpNetworkResponseReceivedParams{RequestID: "r", HasExtraInfo: true, Response: cdpNetworkResponse{Status: 200, StatusText: "Custom OK", Headers: json.RawMessage(`{"X-Cached":"yes"}`)}})
+			sendNetworkFixture(t, srv, "Network.responseReceivedExtraInfo", cdpNetworkResponseReceivedExtraInfoParams{RequestID: "r", StatusCode: tc.wireStatus, Headers: json.RawMessage(`{"ETag":"v1"}`)})
+			sendNetworkFixture(t, srv, "Network.loadingFinished", cdpNetworkLoadingFinishedParams{RequestID: "r"})
+			var response oapi.BrowserNetworkResponseEventData
+			require.NoError(t, json.Unmarshal(ec.waitFor(t, EventNetworkResponse, time.Second).Data, &response))
+			require.Equal(t, tc.wireStatus, response.Status)
+			require.Equal(t, tc.effective, response.EffectiveStatus)
+			require.Equal(t, ptrOf(tc.statusText), response.StatusText)
+			require.Equal(t, oapi.BrowserHttpHeaders{"ETag": "v1"}, response.Headers)
+		})
+	}
+}
+
 func TestNetworkBodyErrorsAreObservable(t *testing.T) {
 	srv := newTestServer(t)
 	defer srv.close()
@@ -322,6 +375,17 @@ func TestExtensionSourceTracksTargetAndRootFrameNavigation(t *testing.T) {
 	m.handleTargetCrashed("s1")
 	event = ec.waitForNew(t, EventPageCrashed, checkpoint, time.Second)
 	require.NotContains(t, *event.Source.Metadata, "extension_id")
+}
+
+func TestExtensionSourceTracksOOPIFRootNavigation(t *testing.T) {
+	m, ec := newComputedMonitor(t)
+	defer m.Stop()
+	m.sessions["s1"] = targetInfo{targetID: "child", targetType: "iframe", parentFrameID: "parent"}
+	m.handleFrameNavigated(cdpPageFrameNavigatedParams{Frame: cdpPageFrame{ID: "child", ParentID: "parent", URL: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/page.html"}}, "s1")
+	m.handleFrameNavigated(cdpPageFrameNavigatedParams{Frame: cdpPageFrame{ID: "nested", ParentID: "child", URL: "https://example.com/"}}, "s1")
+	m.handleTargetCrashed("s1")
+	event := ec.waitFor(t, EventPageCrashed, time.Second)
+	require.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", (*event.Source.Metadata)["extension_id"])
 }
 
 func TestProxyErrorSourceSurvivesOriginChanges(t *testing.T) {
