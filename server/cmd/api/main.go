@@ -207,6 +207,7 @@ func main() {
 		otlpExporter,
 		s2Storage,
 		egressPolicy,
+		api.ProcessOutputConfig{Dir: config.ProcessOutputDir, MaxBytes: config.ProcessOutputMaxBytes, TotalMaxBytes: config.ProcessOutputTotalMaxBytes},
 	)
 	if err != nil {
 		slogger.Error("failed to create api service", "err", err)
