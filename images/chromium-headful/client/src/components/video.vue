@@ -967,7 +967,10 @@
     }
 
     openClipboard(hint?: string) {
-      if (this._clipboard) this._clipboard.open(hint)
+      if (!this._clipboard) return
+      // the panel sits at the top of the player, which the keyboard moves up
+      if (this.is_touch_device && this.keyboardOpen) this._overlay.blur()
+      this._clipboard.open(hint)
     }
 
     async syncClipboard() {

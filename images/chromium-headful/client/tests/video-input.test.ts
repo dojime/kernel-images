@@ -438,6 +438,25 @@ describe('touch paste', () => {
   })
 })
 
+describe('clipboard panel', () => {
+  test('on a touch device it closes the soft keyboard first, so the panel is not moved off screen', () => {
+    const methods = videoMethods(async () => '')
+    const calls: string[] = []
+    const ctx = {
+      is_touch_device: true,
+      keyboardOpen: true,
+      _overlay: { blur: () => calls.push('blur') },
+      _clipboard: { open: (hint: string) => calls.push(`open ${hint}`) },
+    }
+    methods.openClipboard.call(ctx, 'Paste here')
+    expect(calls).toEqual(['blur', 'open Paste here'])
+
+    calls.length = 0
+    methods.openClipboard.call({ ...ctx, is_touch_device: false })
+    expect(calls).toEqual(['open undefined'])
+  })
+})
+
 describe('touch copy', () => {
   class FakeClipboardItem {
     constructor(public items: Record<string, Promise<Blob>>) {}
