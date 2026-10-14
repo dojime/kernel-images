@@ -12,7 +12,11 @@ const compiled = ts.transpileModule(script, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, experimentalDecorators: true },
 }).outputText
 
-function videoMethods(readText: () => Promise<string>, granted = async () => true) {
+function videoMethods(
+  readText: () => Promise<string>,
+  granted = async () => true,
+  globals: Record<string, unknown> = {},
+) {
   const exports: { default?: { prototype: Record<string, Function> } } = {}
   const noDecorator = () => () => undefined
   runInNewContext(compiled, {
@@ -34,6 +38,7 @@ function videoMethods(readText: () => Promise<string>, granted = async () => tru
     window: { self: {}, top: {}, document: { hasFocus: () => true }, setTimeout, clearTimeout },
     navigator: { clipboard: { readText } },
     setTimeout,
+    ...globals,
   })
   return exports.default!.prototype
 }
@@ -367,56 +372,114 @@ describe('touch paste', () => {
   })
 })
 
-describe('remote pointer after touch', () => {
-  test('moves to the bottom right corner once touch input is idle', () => {
-    const methods = videoMethods(async () => '')
-    const sent: string[] = []
-    const ctx = {
-      inputEnabled: true,
-      gestures: { flinging: false },
-      $accessor: { video: { resolution: { w: 1920, h: 1080 } } },
-      $client: { sendData: (event: string, data: unknown) => sent.push(`${event} ${JSON.stringify(data)}`) },
-    }
-    methods.parkPointer.call(ctx)
-    expect(sent).toEqual(['mousemove {"x":1919,"y":1079}'])
-  })
+describe('touch copy', () => {
+  class FakeClipboardItem {
+    constructor(public items: Record<string, Promise<Blob>>) {}
+  }
 
-  test('waits for a fling to end and stays put without input', () => {
-    const methods = videoMethods(async () => '')
+  // write: what the phone clipboard does with the item
+  const copySetup = (write?: (items: FakeClipboardItem[]) => Promise<void>) => {
+    const timers: (() => void)[] = []
+    const written: string[] = []
+    const listeners: ((text: string) => void)[] = []
     const sent: string[] = []
-    let rescheduled = 0
-    const ctx = {
-      inputEnabled: true,
-      gestures: { flinging: true },
-      schedulePointerPark: () => rescheduled++,
-      $client: { sendData: (event: string) => sent.push(event) },
+    const clipboard = {
+      readText: async () => '',
+      write:
+        write ||
+        (async (items: FakeClipboardItem[]) => {
+          written.push(await (await items[0].items['text/plain']).text())
+        }),
     }
-    methods.parkPointer.call(ctx)
-    expect(rescheduled).toBe(1)
-    methods.parkPointer.call({ ...ctx, inputEnabled: false, gestures: { flinging: false } })
-    expect(sent).toEqual([])
-  })
-
-  test('is scheduled when the last finger lifts and cancelled by mouse input', async () => {
-    const methods = videoMethods(async () => '')
-    const sent: string[] = []
+    const methods = videoMethods(async () => '', undefined, {
+      ClipboardItem: FakeClipboardItem,
+      Blob,
+      navigator: { clipboard },
+      window: {
+        setTimeout: (fn: () => void) => timers.push(fn),
+        clearTimeout: () => {},
+      },
+    })
     const ctx: Record<string, any> = {
       inputEnabled: true,
-      hosting: true,
-      locked: false,
-      pointerParkTimer: 0,
-      gestures: { touchEnd: () => {}, flinging: false },
-      $accessor: { video: { resolution: { w: 1920, h: 1080 } } },
-      $client: { sendData: (event: string, data: unknown) => sent.push(`${event} ${JSON.stringify(data)}`) },
-      sendMousePos: () => sent.push('mouse position'),
+      touchNotice: null,
+      keyMap: (key: number) => key,
+      $client: {
+        sendData: (event: string, data: { key: number }) => sent.push(`${event} ${data.key.toString(16)}`),
+        on: (_: string, fn: (text: string) => void) => listeners.push(fn),
+        off: (_: string, fn: (text: string) => void) => listeners.splice(listeners.indexOf(fn), 1),
+      },
     }
-    ctx.parkPointer = () => methods.parkPointer.call(ctx)
-    ctx.schedulePointerPark = () => methods.schedulePointerPark.call(ctx)
-    methods.onTouchEnd.call(ctx, { touches: [{}] })
-    expect(ctx.pointerParkTimer).toBe(0)
-    methods.onTouchEnd.call(ctx, { touches: [] })
-    methods.onMouseMove.call(ctx, {})
-    await new Promise((done) => setTimeout(done, 1300))
-    expect(sent).toEqual(['mouse position'])
+    ctx.showTouchNotice = (text: string) => (ctx.touchNotice = text)
+    ctx.nextRemoteClipboard = () => methods.nextRemoteClipboard.call(ctx)
+    const copy = () => methods.copyToClipboard.call(ctx)
+    const remoteCopies = (text: string) => [...listeners].forEach((fn) => fn(text))
+    const timeout = () => timers.splice(0).forEach((fn) => fn())
+    return { ctx, copy, sent, written, remoteCopies, timeout, listeners }
+  }
+  const settle = () => new Promise((done) => setTimeout(done, 20))
+
+  test('sends Ctrl+C and writes the remote clipboard text to the phone', async () => {
+    const t = copySetup()
+    t.copy()
+    expect(t.sent).toEqual(['keydown ffe3', 'keydown 63', 'keyup 63', 'keyup ffe3'])
+    t.remoteCopies('Order #1234')
+    await settle()
+    expect(t.written).toEqual(['Order #1234'])
+    expect(t.ctx.touchNotice).toBe('Copied')
+    expect(t.listeners).toHaveLength(0)
+  })
+
+  test('starts the clipboard write inside the tap', () => {
+    let calledDuringTap = false
+    const t = copySetup(() => {
+      calledDuringTap = true
+      return new Promise(() => {})
+    })
+    t.copy()
+    expect(calledDuringTap).toBe(true)
+  })
+
+  test('says nothing was copied when the remote clipboard does not change', async () => {
+    const t = copySetup()
+    t.copy()
+    t.timeout()
+    await settle()
+    expect(t.written).toEqual([])
+    expect(t.ctx.touchNotice).toBe('Nothing was copied')
+    expect(t.listeners).toHaveLength(0)
+  })
+
+  test('explains a refused clipboard write', async () => {
+    const t = copySetup(async (items) => {
+      await items[0].items['text/plain']
+      throw new DOMException('denied', 'NotAllowedError')
+    })
+    t.copy()
+    t.remoteCopies('secret')
+    await settle()
+    expect(t.ctx.touchNotice).toBe('Copying to this device was not allowed')
+  })
+
+  test('without ClipboardItem it says so and sends nothing', () => {
+    const methods = videoMethods(async () => '', undefined, { ClipboardItem: undefined })
+    const sent: string[] = []
+    const ctx: Record<string, any> = { inputEnabled: true, $client: { sendData: (e: string) => sent.push(e) } }
+    ctx.showTouchNotice = (text: string) => (ctx.touchNotice = text)
+    methods.copyToClipboard.call(ctx)
+    expect(sent).toEqual([])
+    expect(ctx.touchNotice).toBe('Copying is not available here')
+  })
+})
+
+describe('remote pointer after touch', () => {
+  test('stays where the touch left it', () => {
+    const methods = videoMethods(async () => '')
+    const sent: string[] = []
+    methods.onTouchEnd.call(
+      { gestures: { touchEnd: () => {} }, $client: { sendData: (event: string) => sent.push(event) } },
+      { touches: [] },
+    )
+    expect(sent).toEqual([])
   })
 })

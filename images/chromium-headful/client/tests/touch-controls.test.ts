@@ -145,6 +145,12 @@ describe('keyboard control', () => {
     expect(emitted).toEqual(['toggle'])
   })
 
+  test('a tap on the copy button copies', () => {
+    const { emitted, tap } = control('left')
+    tap('copy')
+    expect(emitted).toEqual(['copy'])
+  })
+
   test('a tap on the paste button pastes, and its first touch over the stream also only wakes it', () => {
     const band = control('bottom')
     band.tap('paste')

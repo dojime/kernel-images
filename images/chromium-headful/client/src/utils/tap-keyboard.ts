@@ -4,17 +4,18 @@
 // the touch point on touchstart. Over a real network the cursor update usually
 // arrives after the finger lifts, and iOS ignores focus() outside a gesture, so
 // there the overlay is focused inside the tap with inputmode="none", which shows
-// no keyboard, and removing inputmode later raises it.
+// no keyboard, and removing inputmode later raises it. If the guess misses a
+// field, the keyboard button opens the keyboard.
 
 import { Point } from './touch-gestures'
 import { CursorKind } from './cursor-shape'
 
-export type TapKeyboardMode = 'auto' | 'chip' | 'always' | 'off'
+export type TapKeyboardMode = 'auto' | 'always' | 'off'
 
 // how long after a tap a text cursor can still raise the keyboard
 export const CURSOR_WAIT_MS = 800
-// a text cursor later than CURSOR_WAIT_MS but within this offers the "Tap to type" button
-export const CURSOR_LATE_MS = 2000
+// how long after Enter the cursor has to leave the I-beam for the keyboard to close
+export const SUBMIT_WAIT_MS = 1000
 // remote px; the smallest radius for the spot where a text cursor was seen
 const TEXT_SPOT_MIN = 16
 // a tap this close (CSS px on screen) to where a text cursor was seen raises the keyboard
@@ -28,7 +29,6 @@ export interface TapKeyboardOutputs {
   hold(): boolean
   // blur the overlay: closes the keyboard or ends a held focus
   release(): void
-  showChip(p: Point): void
 }
 
 export interface Clock {
@@ -38,19 +38,16 @@ export interface Clock {
 }
 
 interface Tap {
-  // client point, for the chip
-  p: Point
   // remote point, for the text spot
   here: Point
   // remote px per CSS px when tapped
   scale: number
-  at: number
 }
 
 type State =
   | { name: 'idle' }
   | { name: 'waiting'; tap: Tap; heldFocus: boolean; timer: number }
-  | { name: 'late'; tap: Tap }
+  | { name: 'submitted'; timer: number }
 
 export class TapKeyboard {
   private state: State = { name: 'idle' }
@@ -87,7 +84,7 @@ export class TapKeyboard {
   }
 
   // Runs inside touchend, the only place iOS lets focus() raise the keyboard.
-  tap(p: Point, here: Point, scale: number) {
+  tap(here: Point, scale: number) {
     this.cancel()
     if (this.mode === 'off') return
     if (this.mode === 'always') {
@@ -95,10 +92,10 @@ export class TapKeyboard {
       return
     }
 
-    const tap = { p, here, scale, at: this.clock.now() }
+    const tap = { here, scale }
     if (this.cursorKind === 'text' && this.cursorChangedAt >= this.touchBeganAt && !this.cursorStale) {
       this.textSpot = here
-      this.offer(tap, true)
+      this.offer(true)
       return
     }
 
@@ -106,9 +103,8 @@ export class TapKeyboard {
     if (this.nearTextSpot(tap)) {
       // the tap may still have moved the pointer off the field, which the end
       // of the window catches
-      this.offer(tap, true)
-      if (this.mode !== 'auto') return
-    } else if (this.mode === 'auto' && !this.out.keyboardOpen() && this.focusNeedsGesture) {
+      this.offer(true)
+    } else if (!this.out.keyboardOpen() && this.focusNeedsGesture) {
       // marked first: the focus event the hold causes must not count as the keyboard opening
       this.state = { name: 'waiting', tap, heldFocus: true, timer: 0 }
       heldFocus = this.out.hold()
@@ -133,14 +129,17 @@ export class TapKeyboard {
       this.clock.clearTimeout(state.timer)
       this.state = { name: 'idle' }
       this.textSpot = state.tap.here
-      this.offer(state.tap, state.heldFocus)
-    } else if (state.name === 'late') {
-      // too late to raise the keyboard, so offer it at the tap
-      this.state = { name: 'idle' }
-      if (this.clock.now() - state.tap.at < CURSOR_LATE_MS && !this.out.keyboardOpen()) {
-        this.out.showChip(state.tap.p)
-      }
+      this.offer(state.heldFocus)
     }
+  }
+
+  // Enter was sent while the keyboard is open. If the I-beam under the last
+  // tap goes away, the form was submitted or the page navigated, so the
+  // keyboard closes; a chat box or textarea keeps its I-beam and the keyboard.
+  submit() {
+    if (!this.out.keyboardOpen() || this.cursorKind !== 'text') return
+    this.cancel()
+    this.state = { name: 'submitted', timer: this.clock.setTimeout(this.endSubmit, SUBMIT_WAIT_MS) }
   }
 
   // the overlay lost focus, so a held focus is gone
@@ -152,9 +151,9 @@ export class TapKeyboard {
   cancel() {
     const state = this.state
     this.state = { name: 'idle' }
-    if (state.name !== 'waiting') return
+    if (state.name === 'idle') return
     this.clock.clearTimeout(state.timer)
-    if (state.heldFocus) this.out.release()
+    if (state.name === 'waiting' && state.heldFocus) this.out.release()
   }
 
   // No new text cursor showed up for the tap. An I-beam that was already
@@ -165,29 +164,30 @@ export class TapKeyboard {
     if (state.name !== 'waiting') return
     this.state = { name: 'idle' }
     if (this.cursorKind === 'text' && this.cursorStale && this.cursorChangedAt >= this.touchBeganAt) {
-      // no later cursor settled it, so ask instead of guessing
+      // no later cursor settled it, so leave it to the keyboard button
       if (state.heldFocus) this.out.release()
-      if (!this.out.keyboardOpen()) this.out.showChip(state.tap.p)
       return
     }
     if (this.cursorKind === 'text') {
       this.textSpot = state.tap.here
-      this.offer(state.tap, state.heldFocus)
+      this.offer(state.heldFocus)
       return
     }
     if (this.nearTextSpot(state.tap)) this.textSpot = null
-    if (this.mode === 'auto') this.state = { name: 'late', tap: state.tap }
     if (this.out.keyboardOpen() || state.heldFocus) this.out.release()
   }
 
-  // inGesture: running inside the tap, or from a focus held since then
-  private offer(tap: Tap, inGesture: boolean) {
+  private endSubmit = () => {
+    if (this.state.name !== 'submitted') return
+    this.state = { name: 'idle' }
+    if (this.cursorKind !== 'text' && this.out.keyboardOpen()) this.out.release()
+  }
+
+  // inGesture: running inside the tap, or from a focus held since then. iOS
+  // ignores a focus outside both.
+  private offer(inGesture: boolean) {
     if (this.out.keyboardOpen()) return
-    if (this.mode === 'auto' && (inGesture || !this.focusNeedsGesture)) {
-      this.out.focus()
-    } else {
-      this.out.showChip(tap.p)
-    }
+    if (inGesture || !this.focusNeedsGesture) this.out.focus()
   }
 
   private nearTextSpot(tap: Tap) {

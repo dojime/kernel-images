@@ -49,6 +49,8 @@ export interface BaseEvents {
   debug: (...message: any[]) => void
   error: (error: Error) => void
   cursor: (image: CursorImage) => void
+  // the remote clipboard changed; sent even when the text is the same
+  clipboard: (text: string) => void
 }
 
 export abstract class BaseClient extends EventEmitter<BaseEvents> {

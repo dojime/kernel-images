@@ -98,6 +98,7 @@
         @toggle="toggleMobileKeyboard"
         @move="onControlMove"
         @paste="pasteFromClipboard"
+        @copy="copyToClipboard"
       />
       <button
         v-if="zoomed && !hideControls"
@@ -106,16 +107,6 @@
         @click.stop.prevent="resetZoom"
       >
         {{ zoomScale.toFixed(1) }}× · Reset
-      </button>
-      <button
-        v-if="typeChip && !hideControls"
-        class="touch-button type-chip"
-        :style="{ left: `${typeChip.x}px`, top: `${typeChip.y}px` }"
-        @touchend.stop.prevent="onTypeChip"
-        @click.stop.prevent="onTypeChip"
-      >
-        <i class="fas fa-keyboard" />
-        <span>Tap to type</span>
       </button>
       <div v-if="touchNotice && !hideControls" class="touch-button touch-notice" role="status">{{ touchNotice }}</div>
       <neko-resolution ref="resolution" v-if="admin" />
@@ -163,12 +154,6 @@
       .zoom-chip {
         left: calc(12px + env(safe-area-inset-left));
         top: calc(12px + env(safe-area-inset-top));
-      }
-
-      .type-chip {
-        transform: translateX(-50%);
-        background: #81b300;
-        color: #000;
       }
 
       .touch-notice {
@@ -320,7 +305,7 @@
   } from '~/utils/touch-controls'
   import { get, set } from '~/utils/localstorage'
   import { CursorImage, CursorKind, cachedCursorKind, classifyCursor } from '~/utils/cursor-shape'
-  import { TextInput, focusNeedsGesture } from '~/utils/text-input'
+  import { TextInput, XK_RETURN, focusNeedsGesture } from '~/utils/text-input'
   import { TapKeyboard, TapKeyboardMode } from '~/utils/tap-keyboard'
   import { keyboardPan, keyboardShrink } from '~/utils/keyboard-pan'
 
@@ -338,11 +323,9 @@
 
   // wheel units per remote pixel of finger travel, so content tracks the finger
   const TOUCH_SCROLL_UNITS_PER_PX = 1.1
-  const TYPE_CHIP_MS = 4000
   const TOUCH_NOTICE_MS = 3000
-  // touch input idle this long moves the remote pointer out of sight; longer
-  // than the tap keyboard's wait, which reads the pointer's cursor shape
-  const POINTER_PARK_MS = 1200
+  // how long Copy waits for the remote clipboard to change after Ctrl+C
+  const COPY_WAIT_MS = 2000
   // kept in the overlay so soft keyboards that only emit input events still report backspace
   const INPUT_SENTINEL = ' '
 
@@ -392,11 +375,8 @@
     private zoom!: ZoomPan
     private zoomScale = 1
     private keyboardOpen = false
-    private typeChip: Point | null = null
-    private typeChipTimer = 0
     private touchNotice: string | null = null
     private touchNoticeTimer = 0
-    private pointerParkTimer = 0
     private cursorSeq = 0
     private keyboardInset = 0
     // how far the video is moved up above the soft keyboard, and the last tap
@@ -548,11 +528,10 @@
     }
 
     // ?tapKeyboard=auto (default) raises the keyboard when a tap lands on text,
-    // chip offers a "tap to type" button there instead, always raises it on
-    // every tap, off leaves it to the keyboard button
+    // always raises it on every tap, off leaves it to the keyboard button
     get tapKeyboardMode(): TapKeyboardMode {
       const value = new URL(location.href).searchParams.get('tapKeyboard')
-      return value === 'chip' || value === 'always' || value === 'off' ? value : 'auto'
+      return value === 'always' || value === 'off' ? value : 'auto'
     }
 
     get inputEnabled() {
@@ -684,7 +663,6 @@
           focus: this.focusForTyping,
           hold: this.holdFocus,
           release: () => this._overlay.blur(),
-          showChip: this.showTypeChip,
         },
         {
           now: () => performance.now(),
@@ -693,7 +671,10 @@
         },
       )
       this.textInput = new TextInput(
-        (event, key) => this.$client.sendData(event, { key }),
+        (event, key) => {
+          this.$client.sendData(event, { key })
+          if (event === 'keydown' && key === XK_RETURN && this.is_touch_device) this.tapKeyboard.submit()
+        },
         () => this.is_touch_device,
       )
       // only touch input reads the cursor shape
@@ -801,9 +782,7 @@
       this.gestures.destroy()
       this.tapKeyboard.cancel()
       this.$client.off('cursor', this.onCursorImage)
-      window.clearTimeout(this.typeChipTimer)
       window.clearTimeout(this.touchNoticeTimer)
-      window.clearTimeout(this.pointerParkTimer)
       if (this.safeAreaProbe) this.safeAreaProbe.remove()
       if (this._wheelHandler) {
         document.removeEventListener('wheel', this._wheelHandler, { capture: true })
@@ -1026,27 +1005,6 @@
 
     onTouchEnd(e: TouchEvent) {
       this.gestures.touchEnd(e)
-      if (e.touches.length === 0) this.schedulePointerPark()
-    }
-
-    // The remote pointer is drawn into the video, which looks out of place
-    // under a finger. Once touch input is idle, move it to the bottom right
-    // corner, where it is drawn almost entirely off screen. Mouse input brings
-    // it back.
-    schedulePointerPark() {
-      window.clearTimeout(this.pointerParkTimer)
-      this.pointerParkTimer = window.setTimeout(this.parkPointer, POINTER_PARK_MS)
-    }
-
-    parkPointer() {
-      if (!this.inputEnabled) return
-      // a fling still scrolls what is under the pointer
-      if (this.gestures.flinging) {
-        this.schedulePointerPark()
-        return
-      }
-      const { w, h } = this.$accessor.video.resolution
-      this.$client.sendData('mousemove', { x: w - 1, y: h - 1 })
     }
 
     onTouchCancel() {
@@ -1075,9 +1033,7 @@
     }
 
     onGestureBegin(p: Point) {
-      window.clearTimeout(this.pointerParkTimer)
       this.unmuteOnInteraction()
-      this.hideTypeChip()
       this.tapKeyboard.touchBegin()
       if (this._controls) this._controls.wake()
 
@@ -1097,7 +1053,7 @@
       const here = this.remotePoint(p)
       this.clickAt(here, 1)
       this.keyboardAnchor = p.y - this._player.getBoundingClientRect().top
-      this.tapKeyboard.tap(p, here, this.remotePerClient())
+      this.tapKeyboard.tap(here, this.remotePerClient())
       if (this.keyboardOpen) this.updateKeyboardView()
     }
 
@@ -1144,7 +1100,6 @@
     }
 
     onGesturePinchStart(mid: Point, distance: number) {
-      this.hideTypeChip()
       this.tapKeyboard.touchBegin()
       this.zoom.pinchStart(mid, distance)
     }
@@ -1214,26 +1169,6 @@
       }
     }
 
-    showTypeChip(p: Point) {
-      const player = this._player.getBoundingClientRect()
-      this.typeChip = {
-        x: Math.max(80, Math.min(player.width - 80, p.x - player.left)),
-        y: Math.max(8, Math.min(player.height - 52, p.y - player.top - 64)),
-      }
-      window.clearTimeout(this.typeChipTimer)
-      this.typeChipTimer = window.setTimeout(this.hideTypeChip, TYPE_CHIP_MS)
-    }
-
-    hideTypeChip() {
-      window.clearTimeout(this.typeChipTimer)
-      this.typeChip = null
-    }
-
-    onTypeChip() {
-      this.hideTypeChip()
-      this.focusForTyping()
-    }
-
     // The Paste control reads the phone's clipboard inside the tap, where
     // Safari allows it after the user confirms, and types the text, so it
     // needs no remote clipboard and works in fields that block pasting.
@@ -1253,6 +1188,55 @@
         },
         () => this.showTouchNotice('Clipboard access was not allowed'),
       )
+    }
+
+    // The Copy control copies the remote selection to the phone. Safari only
+    // lets a page write the clipboard inside the tap, so the write starts here
+    // with its text pending, and the text arrives when the remote clipboard
+    // changes after Ctrl+C.
+    copyToClipboard() {
+      if (!this.inputEnabled) return
+      if (typeof ClipboardItem === 'undefined' || !navigator.clipboard || !navigator.clipboard.write) {
+        this.showTouchNotice('Copying is not available here')
+        return
+      }
+
+      let copied = false
+      const text = this.nextRemoteClipboard().then((t) => {
+        copied = true
+        return new Blob([t], { type: 'text/plain' })
+      })
+      navigator.clipboard.write([new ClipboardItem({ 'text/plain': text })]).then(
+        () => this.showTouchNotice('Copied'),
+        () => this.showTouchNotice(copied ? 'Copying to this device was not allowed' : 'Nothing was copied'),
+      )
+
+      const ctrl = this.keyMap(0xffe3)
+      const c = this.keyMap(0x0063)
+      this.$client.sendData('keydown', { key: ctrl })
+      this.$client.sendData('keydown', { key: c })
+      this.$client.sendData('keyup', { key: c })
+      this.$client.sendData('keyup', { key: ctrl })
+    }
+
+    // the remote clipboard text from the next update, rejected if none comes in time
+    nextRemoteClipboard() {
+      return new Promise<string>((resolve, reject) => {
+        const onClipboard = (text: string) => {
+          window.clearTimeout(timer)
+          this.$client.off('clipboard', onClipboard)
+          if (text) {
+            resolve(text)
+          } else {
+            reject(new Error('the remote clipboard is empty'))
+          }
+        }
+        const timer = window.setTimeout(() => {
+          this.$client.off('clipboard', onClipboard)
+          reject(new Error('the remote clipboard did not change'))
+        }, COPY_WAIT_MS)
+        this.$client.on('clipboard', onClipboard)
+      })
     }
 
     showTouchNotice(text: string) {
@@ -1367,7 +1351,6 @@
     }
 
     onMouseDown(e: MouseEvent) {
-      window.clearTimeout(this.pointerParkTimer)
       this.unmuteOnInteraction()
 
       if (!this.controlling && this.implicitHosting && !this.locked) {
@@ -1401,7 +1384,6 @@
     }
 
     onMouseMove(e: MouseEvent) {
-      window.clearTimeout(this.pointerParkTimer)
       if (!this.hosting || this.locked) {
         return
       }

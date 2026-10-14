@@ -37,7 +37,6 @@ function setup(mode: TapKeyboardMode, ios = true) {
         overlay = 'blurred'
         keyboard.blur()
       },
-      showChip: () => events.push('chip'),
     },
     {
       now: () => clock,
@@ -67,7 +66,7 @@ function setup(mode: TapKeyboardMode, ios = true) {
   const tap = (p: { x: number; y: number }) => {
     keyboard.touchBegin()
     advance(80)
-    keyboard.tap(p, { x: Math.round(p.x * SCALE), y: Math.round(p.y * SCALE) }, SCALE)
+    keyboard.tap({ x: Math.round(p.x * SCALE), y: Math.round(p.y * SCALE) }, SCALE)
   }
   // the user or the OS dismisses the keyboard
   const dismiss = () => {
@@ -109,7 +108,7 @@ describe('tap keyboard on iOS', () => {
     t.advance(40)
     t.keyboard.cursor('text')
     t.advance(40)
-    t.keyboard.tap(field, field, SCALE)
+    t.keyboard.tap(field, SCALE)
     expect(t.events).toEqual(['focus'])
   })
 
@@ -123,7 +122,7 @@ describe('tap keyboard on iOS', () => {
     expect(t.overlay()).toBe('open')
   })
 
-  test('a non-text tap releases the held focus without a keyboard or chip', () => {
+  test('a non-text tap releases the held focus without a keyboard', () => {
     const t = setup('auto')
     t.tap(blank)
     t.advance(100)
@@ -133,12 +132,12 @@ describe('tap keyboard on iOS', () => {
     expect(t.overlay()).toBe('blurred')
   })
 
-  test('a text cursor after the window offers the chip', () => {
+  test('a text cursor after the window does nothing, leaving it to the keyboard button', () => {
     const t = setup('auto')
     t.tap(field)
     t.advance(900)
     t.keyboard.cursor('text')
-    expect(t.events).toEqual(['hold', 'release', 'chip'])
+    expect(t.events).toEqual(['hold', 'release'])
   })
 
   test('a text cursor long after the window does nothing', () => {
@@ -241,7 +240,7 @@ describe('tap keyboard on iOS', () => {
     expect(t.events).toEqual(['hold', 'release', 'hold', 'release'])
   })
 
-  test('an I-beam that may be stale and is never replaced offers the chip', () => {
+  test('an I-beam that may be stale and is never replaced raises nothing', () => {
     const t = setup('auto')
     t.tap(field)
     t.advance(20)
@@ -249,7 +248,7 @@ describe('tap keyboard on iOS', () => {
     t.advance(30)
     t.keyboard.cursor('text')
     t.advance(800)
-    expect(t.events).toEqual(['hold', 'release', 'hold', 'release', 'chip'])
+    expect(t.events).toEqual(['hold', 'release', 'hold', 'release'])
   })
 
   test('a field tap after a non-text tap raises the keyboard', () => {
@@ -298,22 +297,22 @@ describe('tap keyboard on iOS', () => {
     expect(t.events).toEqual(['hold', 'raise-held'])
   })
 
-  test('a held focus lost to the OS falls back to the chip', () => {
+  test('a held focus lost to the OS raises nothing', () => {
     const t = setup('auto')
     t.tap(field)
     t.dismiss()
     t.advance(150)
     t.keyboard.cursor('text')
-    expect(t.events).toEqual(['hold', 'chip'])
+    expect(t.events).toEqual(['hold'])
   })
 
-  test('falls back to the chip when the focus could not be held', () => {
+  test('raises nothing when the focus could not be held', () => {
     const t = setup('auto')
     t.failHold()
     t.tap(field)
     t.advance(150)
     t.keyboard.cursor('text')
-    expect(t.events).toEqual(['hold', 'chip'])
+    expect(t.events).toEqual(['hold'])
   })
 
   test('cancel releases a held focus and ends the wait', () => {
@@ -326,6 +325,71 @@ describe('tap keyboard on iOS', () => {
   })
 })
 
+describe('keyboard after Enter', () => {
+  // the keyboard is open on a field under an I-beam
+  const typing = () => {
+    const t = setup('auto')
+    t.tap(field)
+    t.advance(150)
+    t.keyboard.cursor('text')
+    t.events.length = 0
+    return t
+  }
+
+  test('closes when the I-beam goes away after Enter', () => {
+    const t = typing()
+    t.keyboard.submit()
+    t.advance(300)
+    t.keyboard.cursor('other')
+    t.advance(700)
+    expect(t.events).toEqual(['release'])
+  })
+
+  test('stays open while the I-beam stays, as in a chat box', () => {
+    const t = typing()
+    t.keyboard.submit()
+    t.advance(1500)
+    expect(t.events).toEqual([])
+    expect(t.overlay()).toBe('open')
+  })
+
+  test('stays open when another cursor flashes and the I-beam comes back', () => {
+    const t = typing()
+    t.keyboard.submit()
+    t.advance(200)
+    t.keyboard.cursor('other')
+    t.advance(100)
+    t.keyboard.cursor('text')
+    t.advance(1000)
+    expect(t.events).toEqual([])
+  })
+
+  test('ignores a cursor change after the window and a touch during it', () => {
+    const late = typing()
+    late.keyboard.submit()
+    late.advance(1100)
+    late.keyboard.cursor('other')
+    late.advance(1000)
+    expect(late.events).toEqual([])
+
+    const touched = typing()
+    touched.keyboard.submit()
+    touched.advance(100)
+    touched.keyboard.touchBegin()
+    touched.keyboard.cursor('other')
+    touched.advance(1000)
+    expect(touched.events).toEqual([])
+  })
+
+  test('does nothing without an open keyboard on an I-beam', () => {
+    const t = setup('auto')
+    t.keyboard.cursor('other')
+    t.keyboard.submit()
+    t.advance(1000)
+    expect(t.events).toEqual([])
+  })
+})
+
 describe('tap keyboard elsewhere', () => {
   test('focuses when the cursor arrives without holding focus during the tap', () => {
     const t = setup('auto', false)
@@ -334,22 +398,6 @@ describe('tap keyboard elsewhere', () => {
     t.advance(150)
     t.keyboard.cursor('text')
     expect(t.events).toEqual(['focus'])
-  })
-
-  test('chip mode offers the chip and never focuses', () => {
-    const t = setup('chip')
-    t.tap(field)
-    t.advance(150)
-    t.keyboard.cursor('text')
-    expect(t.events).toEqual(['chip'])
-  })
-
-  test('chip mode shows nothing for a text cursor after the window', () => {
-    const t = setup('chip')
-    t.tap(field)
-    t.advance(900)
-    t.keyboard.cursor('text')
-    expect(t.events).toEqual([])
   })
 
   test('off mode does nothing and always mode focuses inside the tap', () => {

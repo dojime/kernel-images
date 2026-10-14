@@ -346,6 +346,7 @@ export class NekoClient extends BaseClient implements EventEmitter<NekoEvents> {
 
   protected [EVENT.CONTROL.CLIPBOARD]({ text }: ControlClipboardPayload) {
     this.$accessor.remote.setClipboard(text)
+    this.emit('clipboard', text)
   }
 
   /////////////////////////////

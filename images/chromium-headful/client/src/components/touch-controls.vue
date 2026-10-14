@@ -21,6 +21,10 @@
         <span v-if="mode === 'bottom'">{{ keyboardOpen ? 'Hide keyboard' : 'Keyboard' }}</span>
         <span v-else-if="keyboardOpen" class="short">Hide</span>
       </button>
+      <button class="control-button" data-role="copy" aria-label="Copy" @click.stop.prevent="run('copy')">
+        <i class="fas fa-copy" />
+        <span v-if="mode !== 'overlay'" :class="{ short: mode !== 'bottom' }">Copy</span>
+      </button>
       <button
         v-if="keyboardOpen"
         class="control-button"
@@ -29,7 +33,7 @@
         @click.stop.prevent="run('paste')"
       >
         <i class="fas fa-paste" />
-        <span :class="{ short: mode !== 'bottom' }">Paste</span>
+        <span v-if="mode !== 'overlay'" :class="{ short: mode !== 'bottom' }">Paste</span>
       </button>
     </div>
   </div>
@@ -126,7 +130,9 @@
     placeControl,
   } from '~/utils/touch-controls'
 
-  type ControlAction = 'toggle' | 'paste'
+  type ControlAction = 'toggle' | 'paste' | 'copy'
+
+  const ACTIONS: Record<string, ControlAction> = { 'keyboard-toggle': 'toggle', paste: 'paste', copy: 'copy' }
 
   const IDLE_FADE_MS = 3000
   const DRAG_SLOP = 6
@@ -227,7 +233,7 @@
 
     onTouchStart(e: TouchEvent) {
       const button = (e.target as Element).closest('[data-role]')
-      this.touchAction = button && button.getAttribute('data-role') === 'paste' ? 'paste' : 'toggle'
+      this.touchAction = (button && ACTIONS[button.getAttribute('data-role') || '']) || 'toggle'
       this.wakeOnly = this.faded && this.mode === 'overlay'
       this.wake()
       const p = this.localPoint(e.changedTouches[0])
@@ -243,7 +249,7 @@
       this.dragPoint = p
     }
 
-    // runs inside touchend, so a tap can still raise the soft keyboard or read the clipboard
+    // runs inside touchend, so a tap can still raise the soft keyboard or use the clipboard
     onTouchEnd() {
       if (!this.dragPoint) {
         this.touchStart = null
