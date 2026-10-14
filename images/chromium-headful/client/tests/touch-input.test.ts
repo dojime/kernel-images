@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
   charToKeysym,
-  keysymCase,
   keysymNeedsShift,
   needsShift,
   textDiff,
@@ -60,10 +59,11 @@ function remoteX() {
     if (key === XK_CAPS_LOCK) capsLock = !capsLock
     else if (key === XK_BACKSPACE) text = text.slice(0, -1)
     else if (key === XK_RETURN) text += '\n'
-    else if (keysymCase(key)) {
+    else if (key < 0x100 || (key & 0xff000000) === 0x01000000) {
       const ch = String.fromCodePoint(key & 0x00ffffff)
-      text += shift.size > 0 !== capsLock ? ch.toUpperCase() : ch.toLowerCase()
-    } else if (key < 0x100) text += String.fromCharCode(key)
+      const cased = ch.toUpperCase() !== ch.toLowerCase()
+      text += !cased ? ch : shift.size > 0 !== capsLock ? ch.toUpperCase() : ch.toLowerCase()
+    }
   }
   return {
     sink,
@@ -74,18 +74,13 @@ function remoteX() {
     get capsLock() {
       return capsLock
     },
-    setCapsLock: (on: boolean) => (capsLock = on),
   }
 }
 
 describe('soft keyboard text', () => {
   const setup = (touch = true) => {
     const remote = remoteX()
-    const input = new TextInput(
-      remote.sink,
-      () => touch,
-      () => remote.capsLock,
-    )
+    const input = new TextInput(remote.sink, () => touch)
     return { input, remote }
   }
 
@@ -169,16 +164,13 @@ describe('soft keyboard text', () => {
     expect(remote.keys.slice(0, 4)).toEqual([XK_SHIFT_L, 0x41, -0x41, -XK_SHIFT_L])
   })
 
-  test('never sends Caps Lock from a touch device, and types the right case under a remote Caps Lock', () => {
+  test('never sends Caps Lock from a touch device', () => {
     const { input, remote } = setup()
     input.keyDown(XK_CAPS_LOCK)
     input.keyUp(XK_CAPS_LOCK)
-    expect(remote.keys).toEqual([])
-
-    remote.setCapsLock(true)
     input.input('insertText', 'Hi')
     expect(remote.text).toBe('Hi')
-    expect(remote.capsLock).toBe(true)
+    expect(remote.keys.some((k) => Math.abs(k) === XK_CAPS_LOCK)).toBe(false)
   })
 
   test('a Shift held on the remote types capitals without another Shift', () => {
@@ -212,11 +204,7 @@ describe('iOS soft keyboard', () => {
     const saved = Object.getOwnPropertyDescriptor(navigator, 'platform')!
     Object.defineProperty(navigator, 'platform', { value: 'iPhone', configurable: true })
     const remote = remoteX()
-    const input = new TextInput(
-      remote.sink,
-      () => true,
-      () => false,
-    )
+    const input = new TextInput(remote.sink, () => true)
     const listeners: Record<string, ((e: unknown) => void)[]> = {}
     const target = {
       addEventListener: (type: string, fn: (e: unknown) => void) => (listeners[type] ||= []).push(fn),

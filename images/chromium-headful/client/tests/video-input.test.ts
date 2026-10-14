@@ -213,3 +213,30 @@ describe('video touch input', () => {
     expect(sent).toEqual(['gestures cancel', 'keyboard cancel'])
   })
 })
+
+describe('touch keyboard opening', () => {
+  const focus = (touch: boolean) => {
+    const methods = videoMethods(async () => '')
+    const calls: string[] = []
+    const ctx = {
+      hosting: true,
+      is_touch_device: touch,
+      keyboardOpen: false,
+      tapKeyboard: { holding: false },
+      $accessor: { remote: { releaseCapsLock: () => calls.push('release caps lock') } },
+      syncClipboard: () => calls.push('sync clipboard'),
+    }
+    methods.onOverlayFocus.call(ctx)
+    return { ctx, calls }
+  }
+
+  test('turns the remote Caps Lock off when the soft keyboard opens', () => {
+    const { ctx, calls } = focus(true)
+    expect(ctx.keyboardOpen).toBe(true)
+    expect(calls).toEqual(['release caps lock', 'sync clipboard'])
+  })
+
+  test('leaves the remote Caps Lock alone on desktop', () => {
+    expect(focus(false).calls).toEqual(['sync clipboard'])
+  })
+})

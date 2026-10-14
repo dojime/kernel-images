@@ -673,11 +673,6 @@
       this.textInput = new TextInput(
         (event, key) => this.$client.sendData(event, { key }),
         () => this.is_touch_device,
-        // as last synchronized; touch input never changes it
-        () => {
-          const state = this.$accessor.remote.keyboardModifierState
-          return state !== -1 && (state & 1) === 1
-        },
       )
       // only touch input reads the cursor shape
       if (this.is_touch_device) this.$client.on('cursor', this.onCursorImage)
@@ -1409,6 +1404,7 @@
       if (this.tapKeyboard.holding) return
       this.keyboardOpen = true
       if (this.hosting) {
+        if (this.is_touch_device) this.$accessor.remote.releaseCapsLock()
         this.syncClipboard()
       }
     }

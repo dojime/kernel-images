@@ -23,22 +23,11 @@ export function needsShift(ch: string) {
   return ch !== ch.toLowerCase() && ch === ch.toUpperCase()
 }
 
-// Which case a letter keysym is, or null for keys Shift and Caps Lock do not change by case
-export function keysymCase(keysym: number): 'upper' | 'lower' | null {
-  if (keysym >= 0x41 && keysym <= 0x5a) return 'upper'
-  if (keysym >= 0x61 && keysym <= 0x7a) return 'lower'
-  if (keysym >= 0xc0 && keysym <= 0xde && keysym !== 0xd7) return 'upper'
-  if (keysym >= 0xe0 && keysym <= 0xff && keysym !== 0xf7) return 'lower'
-  if ((keysym & 0xff000000) === 0x01000000) {
-    const ch = String.fromCodePoint(keysym & 0x00ffffff)
-    if (needsShift(ch)) return 'upper'
-    if (ch !== ch.toUpperCase() && ch === ch.toLowerCase()) return 'lower'
-  }
-  return null
-}
-
 export function keysymNeedsShift(keysym: number) {
-  return keysymCase(keysym) === 'upper'
+  if (keysym >= 0x41 && keysym <= 0x5a) return true
+  if (keysym >= 0xc0 && keysym <= 0xde && keysym !== 0xd7) return true
+  if ((keysym & 0xff000000) === 0x01000000) return needsShift(String.fromCodePoint(keysym & 0x00ffffff))
+  return false
 }
 
 // iOS (every browser there is WebKit) raises the soft keyboard only for focus()
@@ -64,9 +53,9 @@ type KeySink = (event: 'keydown' | 'keyup', keysym: number) => void
 // events. On touch devices each letter's case comes from its keysym. Soft
 // keyboards report their Shift and Caps Lock as separate key events (iOS sends
 // them as synthetic modifier events, and the Guacamole keyboard releases every
-// key on iOS right after pressing it), so Caps Lock is never sent and Shift is
-// sent around a letter when the remote's Shift and Caps Lock would give it the
-// other case.
+// key on iOS right after pressing it), so Caps Lock is never sent, the remote's
+// Caps Lock is turned off when the keyboard opens, and Shift is sent around a
+// capital unless the remote already holds Shift.
 export class TextInput {
   composing = false
   private composed = ''
@@ -78,7 +67,7 @@ export class TextInput {
   private shiftDown = new Set<number>()
   private shiftWrapped = new Set<number>()
 
-  constructor(private send: KeySink, private touch: () => boolean, private remoteCapsLock: () => boolean) {}
+  constructor(private send: KeySink, private touch: () => boolean) {}
 
   // a key from the Guacamole keyboard; sent is the keysym after layout mapping
   keyDown(keysym: number, sent = keysym) {
@@ -175,8 +164,6 @@ export class TextInput {
   }
 
   private needsShift(keysym: number) {
-    if (!this.touch() || this.shiftDown.size > 0) return false
-    const letter = keysymCase(keysym)
-    return letter !== null && (letter === 'upper') !== this.remoteCapsLock()
+    return this.touch() && this.shiftDown.size === 0 && keysymNeedsShift(keysym)
   }
 }
