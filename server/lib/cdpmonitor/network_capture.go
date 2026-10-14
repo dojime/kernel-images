@@ -191,8 +191,10 @@ func (m *Monitor) publishNetworkRequest(ctx context.Context, key networkRequestK
 		m.pendReqMu.Lock()
 		payload := h.request
 		if h.requestHeaders != nil {
-			payload.Headers = nil
-			_ = json.Unmarshal(h.requestHeaders, &payload.Headers)
+			var headers oapi.BrowserHttpHeaders
+			if json.Unmarshal(h.requestHeaders, &headers) == nil && headers != nil {
+				payload.Headers = headers
+			}
 		}
 		m.pendReqMu.Unlock()
 		data, _ := json.Marshal(payload)
@@ -266,12 +268,15 @@ func (m *Monitor) emitNetworkResponse(ctx context.Context, key networkRequestKey
 			m.pendReqMu.Lock()
 			if h.requestHeaders != nil {
 				var requestHeaders oapi.BrowserHttpHeaders
-				_ = json.Unmarshal(h.requestHeaders, &requestHeaders)
-				payload.RequestHeaders = &requestHeaders
+				if json.Unmarshal(h.requestHeaders, &requestHeaders) == nil && requestHeaders != nil {
+					payload.RequestHeaders = &requestHeaders
+				}
 			}
 			if h.responseExtra != nil {
-				payload.Headers = nil
-				_ = json.Unmarshal(h.responseExtra.Headers, &payload.Headers)
+				var responseHeaders oapi.BrowserHttpHeaders
+				if json.Unmarshal(h.responseExtra.Headers, &responseHeaders) == nil && responseHeaders != nil {
+					payload.Headers = responseHeaders
+				}
 				payload.Status = h.responseExtra.StatusCode
 				if payload.Status != state.status {
 					payload.EffectiveStatus = ptrOf(state.status)

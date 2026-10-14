@@ -794,6 +794,8 @@ func (m *Monitor) handleFrameNavigated(p cdpPageFrameNavigatedParams, sessionID 
 	m.sessionsMu.Lock()
 	info, tracked := m.sessions[sessionID]
 	cs := m.computedStates[sessionID]
+	// Chromium uses an OOPIF's root frame ID as its target ID; that root can
+	// still have a parentId, unlike a top-level page's root.
 	if tracked && (p.Frame.ParentID == "" || p.Frame.ID == info.targetID) {
 		info.url = p.Frame.URL
 		m.sessions[sessionID] = info
@@ -830,13 +832,17 @@ func (m *Monitor) handleFrameNavigated(p cdpPageFrameNavigatedParams, sessionID 
 
 		m.pendReqMu.Lock()
 		inflight := 0
+		nextSeq := -1
+		if cs != nil {
+			nextSeq = cs.currentNavSeq() + 1
+		}
 		for key, req := range m.pendingRequests {
 			if req.sessionID != sessionID {
 				continue
 			}
 			req.countedNavSeq = -1
 			if cs != nil && req.loaderID == p.Frame.LoaderID {
-				req.countedNavSeq = cs.currentNavSeq() + 1
+				req.countedNavSeq = nextSeq
 				inflight++
 			}
 			m.pendingRequests[key] = req

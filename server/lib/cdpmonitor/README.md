@@ -121,19 +121,26 @@ by session, request ID, and redirect hop. Cached hops without ExtraInfo do not
 consume the next hop's headers. A `network_request` waits at most one second for
 wire headers, then uses the base headers so a hanging request remains visible.
 `network_response.request_headers` retains wire request headers that arrive after
-that initial event. Response capture waits at most one second for promised headers
-before falling back to the base response. Capture remains best-effort when Chrome
-omits events or a target disconnects. Redirects emit a response for each hop,
-without a body. Request IDs remain the same across a redirect chain.
+that initial event. After body retrieval, response capture waits up to one second
+total for both request and response headers, sharing one deadline. It then falls
+back to the base headers for anything still missing or invalid. Capture remains
+best-effort when Chrome omits events or a target disconnects. Redirects emit a
+response for each hop, without a body. Request IDs remain the same across a
+redirect chain.
 
 Responses, failures, and proxy errors for tracked requests publish after their
-request event. Header correlation stays active for pending redirect responses
-after the final request completes or fails, until their capture finishes.
+request event. There is no ordering guarantee between different redirect hops:
+a hop's response can publish before or after the next hop's request.
+Header correlation stays active for pending redirect responses after the final
+request completes or fails, until their capture finishes.
 
 `network_response.status` is the wire status when available. `effective_status`
 is present when Chrome's effective response differs, such as wire 304 with an
 effective 200 and a cached body. `headers` contains the wire response headers when
-available rather than Chrome's merged cache headers.
+available rather than Chrome's merged cache headers. When wire and effective status
+differ, `status_text` uses the standard HTTP reason phrase for the wire status
+(or is omitted for an unknown code), rather than the cached response's phrase.
+Otherwise Chrome's original `status_text`, including a custom phrase, is retained.
 
 While optional telemetry is enabled, `Network.enable` requests durable body
 storage with `maxTotalBufferSize` set to 10 MiB on each attached session. Disabling
@@ -159,6 +166,19 @@ Run the browser regressions with:
 KERNEL_CDPMONITOR_CHROME_E2E=1 go test -race ./lib/cdpmonitor \
   -run '^TestNetwork(WireCapture|BodiesSurviveNavigation|ExtensionAttribution)$' -count=1
 ```
+
+Bundled-extension attribution also has a browser regression that loads an actual
+installed bundle and checks its Chromium-assigned ID. Run it once for each bundled
+path (`/home/kernel/extensions/kernel` and `/home/kernel/extensions/capmonster`):
+
+```sh
+KERNEL_CDPMONITOR_BUNDLED_EXTENSION_PATH=/home/kernel/extensions/kernel \
+  go test -race ./lib/cdpmonitor -run '^TestNetworkBundledExtensionAttribution$' -count=1
+```
+
+This requires the bundle at its installation path, with its normal manifest and
+assets. It is separate from the general Chromium suite because the bundles are
+not included in this source tree. An explicit path that cannot load fails the test.
 
 ## Event taxonomy
 
