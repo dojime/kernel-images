@@ -776,15 +776,33 @@ func (c *Client) GetWindowBounds(ctx context.Context) (WindowBounds, error) {
 	}, nil
 }
 
+// ErrWindowFullscreen is returned by SetContentsSize when the window is
+// fullscreen. Leaving fullscreen would exit kiosk mode or a page's HTML5
+// fullscreen, so the window is left as it is.
+var ErrWindowFullscreen = errors.New("window is fullscreen")
+
 // SetContentsSize resizes the OS window backing the first page target so its
-// web contents are width x height, via Browser.setContentsSize. The window
-// keeps that size after this client disconnects, unlike
-// Emulation.setDeviceMetricsOverride, which Chromium clears when the session
-// that set it detaches.
+// web contents are width x height, via Browser.setContentsSize. Chromium
+// rejects that for a maximized or minimized window, so such a window is first
+// restored to normal. The size belongs to the window and outlives this client,
+// unlike Emulation.setDeviceMetricsOverride, which Chromium 154+ clears when
+// the session that set it detaches.
 func (c *Client) SetContentsSize(ctx context.Context, width, height int) error {
 	bounds, err := c.GetWindowBounds(ctx)
 	if err != nil {
 		return err
+	}
+
+	switch bounds.WindowState {
+	case "fullscreen":
+		return ErrWindowFullscreen
+	case "maximized", "minimized":
+		if _, err := c.Send(ctx, "Browser.setWindowBounds", map[string]any{
+			"windowId": bounds.WindowID,
+			"bounds":   map[string]any{"windowState": "normal"},
+		}, ""); err != nil {
+			return fmt.Errorf("Browser.setWindowBounds normal: %w", err)
+		}
 	}
 
 	if _, err := c.Send(ctx, "Browser.setContentsSize", map[string]any{
@@ -794,5 +812,46 @@ func (c *Client) SetContentsSize(ctx context.Context, width, height int) error {
 	}, ""); err != nil {
 		return fmt.Errorf("Browser.setContentsSize: %w", err)
 	}
+	return nil
+}
+
+// SetDeviceMetricsOverride sets the viewport dimensions on the first page
+// target found in the browser. It attaches to the target with a flattened
+// session, sends Emulation.setDeviceMetricsOverride, then detaches.
+func (c *Client) SetDeviceMetricsOverride(ctx context.Context, width, height int) error {
+	pageTargetID, err := c.firstPageTargetID(ctx)
+	if err != nil {
+		return err
+	}
+
+	attachResult, err := c.Send(ctx, "Target.attachToTarget", map[string]any{
+		"targetId": pageTargetID,
+		"flatten":  true,
+	}, "")
+	if err != nil {
+		return fmt.Errorf("Target.attachToTarget: %w", err)
+	}
+
+	var attach struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(attachResult, &attach); err != nil {
+		return fmt.Errorf("unmarshal attach: %w", err)
+	}
+
+	_, err = c.Send(ctx, "Emulation.setDeviceMetricsOverride", map[string]any{
+		"width":             width,
+		"height":            height,
+		"deviceScaleFactor": 1,
+		"mobile":            false,
+	}, attach.SessionID)
+	if err != nil {
+		return fmt.Errorf("Emulation.setDeviceMetricsOverride: %w", err)
+	}
+
+	_, _ = c.Send(ctx, "Target.detachFromTarget", map[string]any{
+		"sessionId": attach.SessionID,
+	}, "")
+
 	return nil
 }

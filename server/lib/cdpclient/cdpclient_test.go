@@ -16,21 +16,18 @@ import (
 )
 
 // fakeCDP is a minimal CDP server that responds to the commands used by
-// SetContentsSize and GetBrowserVersion.
+// SetDeviceMetricsOverride and GetBrowserVersion.
 type fakeCDP struct {
 	getTargetsCalls     int
 	attachCalled        bool
-	windowForTarget     string
-	setContentsCalled   bool
-	setContentsWindowID int
-	setContentsWidth    int
-	setContentsHeight   int
+	setMetricsCalled    bool
+	setMetricsWidth     int
+	setMetricsHeight    int
 	detachCalled        bool
 	pageTargetID        string
-	windowID            int
 	sessionID           string
 	failGetTargets      bool
-	failSetContents     bool
+	failSetMetrics      bool
 	returnNoPageTargets bool
 	noPageTargetsFor    int
 	getVersionCalled    bool
@@ -52,6 +49,12 @@ type fakeCDP struct {
 	createParams        map[string]any
 	closedTargetID      string
 	closeTargetMissing  bool
+	windowID            int
+	windowState         string
+	browserCalls        []string
+	setWindowBoundsArgs map[string]any
+	setContentsArgs     map[string]any
+	failSetContents     bool
 }
 
 func (f *fakeCDP) handler(w http.ResponseWriter, r *http.Request) {
@@ -107,24 +110,33 @@ func (f *fakeCDP) handler(w http.ResponseWriter, r *http.Request) {
 		case "Target.attachToTarget":
 			f.attachCalled = true
 			result = map[string]string{"sessionId": f.sessionID}
-		case "Browser.getWindowForTarget":
-			var params map[string]string
-			_ = json.Unmarshal(req.Params, &params)
-			f.windowForTarget = params["targetId"]
-			result = map[string]any{
-				"windowId": f.windowID,
-				"bounds":   map[string]any{"width": 800, "height": 600, "windowState": "normal"},
-			}
-		case "Browser.setContentsSize":
-			f.setContentsCalled = true
-			if f.failSetContents {
-				cdpErr = &Error{Code: -2, Message: "contents size error"}
+		case "Emulation.setDeviceMetricsOverride":
+			f.setMetricsCalled = true
+			if f.failSetMetrics {
+				cdpErr = &Error{Code: -2, Message: "metrics error"}
 			} else {
 				var params map[string]any
 				_ = json.Unmarshal(req.Params, &params)
-				f.setContentsWindowID = int(params["windowId"].(float64))
-				f.setContentsWidth = int(params["width"].(float64))
-				f.setContentsHeight = int(params["height"].(float64))
+				f.setMetricsWidth = int(params["width"].(float64))
+				f.setMetricsHeight = int(params["height"].(float64))
+				result = map[string]any{}
+			}
+		case "Browser.getWindowForTarget":
+			f.browserCalls = append(f.browserCalls, req.Method)
+			result = map[string]any{
+				"windowId": f.windowID,
+				"bounds":   map[string]any{"width": 800, "height": 600, "windowState": f.windowState},
+			}
+		case "Browser.setWindowBounds":
+			f.browserCalls = append(f.browserCalls, req.Method)
+			_ = json.Unmarshal(req.Params, &f.setWindowBoundsArgs)
+			result = map[string]any{}
+		case "Browser.setContentsSize":
+			f.browserCalls = append(f.browserCalls, req.Method)
+			if f.failSetContents {
+				cdpErr = &Error{Code: -32000, Message: "Restore window to normal state before setting content size"}
+			} else {
+				_ = json.Unmarshal(req.Params, &f.setContentsArgs)
 				result = map[string]any{}
 			}
 		case "Target.detachFromTarget":
@@ -201,11 +213,11 @@ func startFakeCDP(t *testing.T, f *fakeCDP) string {
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
 }
 
-func TestSetContentsSize(t *testing.T) {
+func TestSetDeviceMetricsOverride(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		f := &fakeCDP{
 			pageTargetID: "target-123",
-			windowID:     7,
+			sessionID:    "session-abc",
 		}
 		url := startFakeCDP(t, f)
 
@@ -214,16 +226,15 @@ func TestSetContentsSize(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetContentsSize(ctx, 1920, 1080)
+		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
 		require.NoError(t, err)
 
 		assert.Equal(t, 1, f.getTargetsCalls)
-		assert.Equal(t, "target-123", f.windowForTarget)
-		assert.True(t, f.setContentsCalled)
-		assert.Equal(t, 7, f.setContentsWindowID)
-		assert.Equal(t, 1920, f.setContentsWidth)
-		assert.Equal(t, 1080, f.setContentsHeight)
-		assert.False(t, f.attachCalled)
+		assert.True(t, f.attachCalled)
+		assert.True(t, f.setMetricsCalled)
+		assert.True(t, f.detachCalled)
+		assert.Equal(t, 1920, f.setMetricsWidth)
+		assert.Equal(t, 1080, f.setMetricsHeight)
 	})
 
 	t.Run("no page target", func(t *testing.T) {
@@ -245,17 +256,18 @@ func TestSetContentsSize(t *testing.T) {
 		defer client.Close()
 
 		start := time.Now()
-		err = client.SetContentsSize(ctx, 1920, 1080)
+		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no page target found")
 		assert.NotErrorIs(t, err, context.DeadlineExceeded)
 		assert.GreaterOrEqual(t, time.Since(start), pageTargetWaitTimeout)
-		assert.False(t, f.setContentsCalled)
+		assert.False(t, f.attachCalled)
 	})
 
 	t.Run("waits for first page target", func(t *testing.T) {
 		f := &fakeCDP{
 			pageTargetID:     "target-123",
+			sessionID:        "session-abc",
 			noPageTargetsFor: 3,
 		}
 		url := startFakeCDP(t, f)
@@ -265,11 +277,11 @@ func TestSetContentsSize(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetContentsSize(ctx, 1920, 1080)
+		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
 		require.NoError(t, err)
 
 		assert.Equal(t, 4, f.getTargetsCalls)
-		assert.True(t, f.setContentsCalled)
+		assert.True(t, f.setMetricsCalled)
 	})
 
 	t.Run("no page target respects context", func(t *testing.T) {
@@ -289,7 +301,7 @@ func TestSetContentsSize(t *testing.T) {
 		time.AfterFunc(250*time.Millisecond, cancel)
 
 		start := time.Now()
-		err = client.SetContentsSize(ctx, 1920, 1080)
+		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Less(t, time.Since(start), pageTargetWaitTimeout)
@@ -306,15 +318,16 @@ func TestSetContentsSize(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetContentsSize(ctx, 1920, 1080)
+		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Target.getTargets")
 	})
 
-	t.Run("setContentsSize failure", func(t *testing.T) {
+	t.Run("setDeviceMetrics failure", func(t *testing.T) {
 		f := &fakeCDP{
-			pageTargetID:    "target-123",
-			failSetContents: true,
+			pageTargetID:   "target-123",
+			sessionID:      "session-abc",
+			failSetMetrics: true,
 		}
 		url := startFakeCDP(t, f)
 
@@ -323,9 +336,9 @@ func TestSetContentsSize(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetContentsSize(ctx, 800, 600)
+		err = client.SetDeviceMetricsOverride(ctx, 800, 600)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "Browser.setContentsSize")
+		assert.Contains(t, err.Error(), "Emulation.setDeviceMetricsOverride")
 	})
 
 	t.Run("context cancellation", func(t *testing.T) {
@@ -340,6 +353,64 @@ func TestSetContentsSize(t *testing.T) {
 
 		_, err := Dial(ctx, url)
 		require.Error(t, err)
+	})
+}
+
+func TestSetContentsSize(t *testing.T) {
+	dial := func(t *testing.T, f *fakeCDP) *Client {
+		t.Helper()
+		client, err := Dial(context.Background(), startFakeCDP(t, f))
+		require.NoError(t, err)
+		t.Cleanup(func() { client.Close() })
+		return client
+	}
+
+	t.Run("normal window", func(t *testing.T) {
+		f := &fakeCDP{pageTargetID: "target-123", windowID: 7, windowState: "normal"}
+		require.NoError(t, dial(t, f).SetContentsSize(context.Background(), 1920, 1080))
+
+		assert.Equal(t, []string{"Browser.getWindowForTarget", "Browser.setContentsSize"}, f.browserCalls)
+		assert.Equal(t, map[string]any{"windowId": 7.0, "width": 1920.0, "height": 1080.0}, f.setContentsArgs)
+	})
+
+	for _, state := range []string{"maximized", "minimized"} {
+		t.Run(state+" window is restored first", func(t *testing.T) {
+			f := &fakeCDP{pageTargetID: "target-123", windowID: 7, windowState: state}
+			require.NoError(t, dial(t, f).SetContentsSize(context.Background(), 1280, 720))
+
+			assert.Equal(t, []string{"Browser.getWindowForTarget", "Browser.setWindowBounds", "Browser.setContentsSize"}, f.browserCalls)
+			assert.Equal(t, map[string]any{"windowId": 7.0, "bounds": map[string]any{"windowState": "normal"}}, f.setWindowBoundsArgs)
+			assert.Equal(t, map[string]any{"windowId": 7.0, "width": 1280.0, "height": 720.0}, f.setContentsArgs)
+		})
+	}
+
+	t.Run("fullscreen window is left alone", func(t *testing.T) {
+		f := &fakeCDP{pageTargetID: "target-123", windowID: 7, windowState: "fullscreen"}
+		err := dial(t, f).SetContentsSize(context.Background(), 1280, 720)
+
+		assert.ErrorIs(t, err, ErrWindowFullscreen)
+		assert.Equal(t, []string{"Browser.getWindowForTarget"}, f.browserCalls)
+	})
+
+	t.Run("setContentsSize failure", func(t *testing.T) {
+		f := &fakeCDP{pageTargetID: "target-123", windowID: 7, windowState: "normal", failSetContents: true}
+		err := dial(t, f).SetContentsSize(context.Background(), 1280, 720)
+
+		var cdpErr *Error
+		require.ErrorAs(t, err, &cdpErr)
+		assert.Contains(t, err.Error(), "Browser.setContentsSize")
+	})
+
+	t.Run("no page target", func(t *testing.T) {
+		defer func(d time.Duration) { pageTargetWaitTimeout = d }(pageTargetWaitTimeout)
+		pageTargetWaitTimeout = 100 * time.Millisecond
+
+		f := &fakeCDP{returnNoPageTargets: true}
+		err := dial(t, f).SetContentsSize(context.Background(), 1280, 720)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no page target found")
+		assert.Empty(t, f.browserCalls)
 	})
 }
 
