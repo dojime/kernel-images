@@ -5,6 +5,7 @@
 export const XK_SHIFT_L = 0xffe1
 export const XK_SHIFT_R = 0xffe2
 export const XK_CAPS_LOCK = 0xffe5
+export const XK_CONTROL_L = 0xffe3
 export const XK_BACKSPACE = 0xff08
 export const XK_RETURN = 0xff0d
 
@@ -46,6 +47,10 @@ export function textDiff(prev: string, next: string) {
   return { deletes: a.length - common, insert: b.slice(common).join('') }
 }
 
+function isModifier(keysym: number) {
+  return (keysym >= 0xffe1 && keysym <= 0xffee) || keysym === 0xfe03
+}
+
 type KeySink = (event: 'keydown' | 'keyup', keysym: number) => void
 
 // The one path from keyboard input to X key events: key events from the
@@ -66,6 +71,10 @@ export class TextInput {
   // Shift keys held on the remote, from the keys sent
   private shiftDown = new Set<number>()
   private shiftWrapped = new Set<number>()
+  // a Ctrl tapped on the extra keys row holds for the next key only
+  private ctrlLatched = false
+  private ctrlWrapped: number | null = null
+  onCtrlLatch: (latched: boolean) => void = () => {}
 
   constructor(private send: KeySink, private touch: () => boolean) {}
 
@@ -73,8 +82,7 @@ export class TextInput {
   keyDown(keysym: number, sent = keysym) {
     this.down(keysym, sent)
     // modifiers type nothing, and iOS sends its soft Shift as one
-    const modifier = (keysym >= 0xffe1 && keysym <= 0xffee) || keysym === 0xfe03
-    if (!modifier) this.keyed = true
+    if (!isModifier(keysym)) this.keyed = true
   }
 
   keyUp(keysym: number, sent = keysym) {
@@ -116,6 +124,16 @@ export class TextInput {
     }
   }
 
+  latchCtrl(latched: boolean) {
+    this.ctrlLatched = latched
+    this.onCtrlLatch(latched)
+  }
+
+  // a key from the extra keys row
+  key(keysym: number) {
+    this.press(keysym)
+  }
+
   // pasted text, without the line break copied text often ends with
   paste(text: string) {
     this.type(text.replace(/[\r\n]+$/, ''))
@@ -153,6 +171,10 @@ export class TextInput {
 
   private down(keysym: number, sent: number) {
     if (this.touch() && keysym === XK_CAPS_LOCK) return
+    if (this.ctrlLatched && !isModifier(keysym) && this.ctrlWrapped === null) {
+      this.ctrlWrapped = keysym
+      this.send('keydown', XK_CONTROL_L)
+    }
     if (this.needsShift(keysym)) {
       this.shiftWrapped.add(keysym)
       this.send('keydown', XK_SHIFT_L)
@@ -166,6 +188,11 @@ export class TextInput {
     this.send('keyup', sent)
     this.shiftDown.delete(keysym)
     if (this.shiftWrapped.delete(keysym)) this.send('keyup', XK_SHIFT_L)
+    if (this.ctrlWrapped === keysym) {
+      this.ctrlWrapped = null
+      this.send('keyup', XK_CONTROL_L)
+      this.latchCtrl(false)
+    }
   }
 
   private needsShift(keysym: number) {

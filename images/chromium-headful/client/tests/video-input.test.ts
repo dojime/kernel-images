@@ -189,6 +189,7 @@ describe('video touch input', () => {
     tapKeyboard: { tap: () => {}, cancel: () => sent.push('keyboard cancel') },
     gestures: { cancel: () => sent.push('gestures cancel') },
     resetZoom: () => sent.push('reset zoom'),
+    withdrawCopy: () => {},
     _player: { getBoundingClientRect: () => ({ top: 0 }) },
     keyboardOpen: false,
   })
@@ -315,60 +316,125 @@ describe('video with the soft keyboard open', () => {
   })
 })
 
-describe('touch paste', () => {
-  const pasteContext = () => {
-    const pasted: string[] = []
-    const ctx: Record<string, any> = {
-      inputEnabled: true,
-      hosting: true,
-      locked: false,
-      is_touch_device: true,
-      touchNotice: null,
-      textInput: { paste: (text: string) => pasted.push(text) },
-      $client: {
-        sendData: () => {
-          throw new Error('touch paste must not send a paste shortcut')
-        },
+// the remote side of the clipboard: control/clipboard updates and the keys sent
+function clipboardSetup(globals: Record<string, unknown> = {}) {
+  const timers: (() => void)[] = []
+  const listeners: ((text: string) => void)[] = []
+  const sent: string[] = []
+  const typed: string[] = []
+  const methods = videoMethods(async () => '', undefined, {
+    window: { setTimeout: (fn: () => void) => timers.push(fn), clearTimeout: () => {} },
+    ...globals,
+  })
+  const ctx: Record<string, any> = {
+    inputEnabled: true,
+    hosting: true,
+    locked: false,
+    is_touch_device: true,
+    touchNotice: null,
+    panel: null,
+    copyWrites: 0,
+    keyMap: (key: number) => key,
+    textInput: { paste: (text: string) => typed.push(text) },
+    $accessor: {
+      remote: {
+        setClipboard: () => {},
+        sendClipboard: (text: string) => sent.push(`clipboard ${text}`),
       },
-    }
-    ctx.showTouchNotice = (text: string) => (ctx.touchNotice = text)
-    return { ctx, pasted }
+    },
+    $client: {
+      sendData: (event: string, data: { key: number }) => sent.push(`${event} ${data.key.toString(16)}`),
+      on: (_: string, fn: (text: string) => void) => listeners.push(fn),
+      off: (_: string, fn: (text: string) => void) => listeners.splice(listeners.indexOf(fn), 1),
+    },
   }
-  const settle = () => new Promise((done) => setTimeout(done, 0))
+  for (const name of ['nextRemoteClipboard', 'pressShortcut', 'pasteText']) {
+    ctx[name] = (...args: unknown[]) => methods[name].call(ctx, ...args)
+  }
+  ctx.showTouchNotice = (text: string) => (ctx.touchNotice = text)
+  ctx.openClipboard = (hint: string) => (ctx.panel = hint)
+  return {
+    ctx,
+    methods,
+    sent,
+    typed,
+    listeners,
+    remoteClipboard: (text: string) => [...listeners].forEach((fn) => fn(text)),
+    timeout: () => timers.splice(0).forEach((fn) => fn()),
+  }
+}
+const settle = () => new Promise((done) => setTimeout(done, 20))
+const long = 'a'.repeat(40)
 
-  test('the Paste control types the phone clipboard', async () => {
-    const methods = videoMethods(async () => 'Secret1')
-    const { ctx, pasted } = pasteContext()
-    methods.pasteFromClipboard.call(ctx)
-    await settle()
-    expect(pasted).toEqual(['Secret1'])
-    expect(ctx.touchNotice).toBe(null)
+describe('touch paste', () => {
+  test('types short text', () => {
+    const t = clipboardSetup()
+    t.ctx.pasteText('123456\n')
+    expect(t.typed).toEqual(['123456'])
+    expect(t.sent).toEqual([])
   })
 
-  test('a denied clipboard read explains itself and types nothing', async () => {
-    const methods = videoMethods(() => Promise.reject(new DOMException('denied', 'NotAllowedError')))
-    const { ctx, pasted } = pasteContext()
-    methods.pasteFromClipboard.call(ctx)
+  test('pastes longer text through the remote clipboard and Ctrl+V once the remote confirms it', async () => {
+    const t = clipboardSetup()
+    t.ctx.pasteText(long)
+    expect(t.sent).toEqual([`clipboard ${long}`])
+    t.remoteClipboard(long)
     await settle()
-    expect(pasted).toEqual([])
-    expect(ctx.touchNotice).toBe('Clipboard access was not allowed')
+    expect(t.sent.slice(1)).toEqual(['keydown ffe3', 'keydown 76', 'keyup 76', 'keyup ffe3'])
+    expect(t.typed).toEqual([])
+  })
+
+  test('types longer text when the remote never confirms the clipboard', async () => {
+    const t = clipboardSetup()
+    t.ctx.pasteText(long)
+    t.timeout()
+    await settle()
+    expect(t.typed).toEqual([long])
+    expect(t.sent).toEqual([`clipboard ${long}`])
+  })
+
+  test('types longer text when the remote clipboard holds other text', async () => {
+    const t = clipboardSetup()
+    t.ctx.pasteText(long)
+    t.remoteClipboard('something else')
+    await settle()
+    expect(t.typed).toEqual([long])
+  })
+
+  test('the Paste key reads the phone clipboard', async () => {
+    const t = clipboardSetup({ navigator: { clipboard: { readText: async () => 'Secret1' } } })
+    t.methods.pasteFromClipboard.call(t.ctx)
+    await settle()
+    expect(t.typed).toEqual(['Secret1'])
+  })
+
+  test('a refused or missing clipboard read opens the clipboard panel', async () => {
+    const denied = clipboardSetup({
+      navigator: { clipboard: { readText: () => Promise.reject(new DOMException('denied', 'NotAllowedError')) } },
+    })
+    denied.methods.pasteFromClipboard.call(denied.ctx)
+    await settle()
+    expect(denied.ctx.panel).toContain('not allowed')
+    expect(denied.typed).toEqual([])
+
+    const missing = clipboardSetup({ navigator: { clipboard: undefined } })
+    missing.methods.pasteFromClipboard.call(missing.ctx)
+    expect(missing.ctx.panel).toBe('Paste here, then tap Paste into page')
   })
 
   test('an empty clipboard says so', async () => {
-    const methods = videoMethods(async () => '')
-    const { ctx } = pasteContext()
-    methods.pasteFromClipboard.call(ctx)
+    const t = clipboardSetup({ navigator: { clipboard: { readText: async () => '' } } })
+    t.methods.pasteFromClipboard.call(t.ctx)
     await settle()
-    expect(ctx.touchNotice).toBe('The clipboard is empty')
+    expect(t.ctx.touchNotice).toBe('The clipboard is empty')
   })
 
-  test('a native paste on a touch device types the text', async () => {
-    const methods = videoMethods(async () => '')
-    const { ctx, pasted } = pasteContext()
-    ctx.pastePending = true
-    await methods.onPaste.call(ctx, { clipboardData: { getData: () => '123456' } })
-    expect(pasted).toEqual(['123456'])
-    expect(ctx.pastePending).toBe(false)
+  test('a native paste on a touch device goes the same way', async () => {
+    const t = clipboardSetup()
+    t.ctx.pastePending = true
+    await t.methods.onPaste.call(t.ctx, { clipboardData: { getData: () => '123456' } })
+    expect(t.typed).toEqual(['123456'])
+    expect(t.ctx.pastePending).toBe(false)
   })
 })
 
@@ -376,73 +442,29 @@ describe('touch copy', () => {
   class FakeClipboardItem {
     constructor(public items: Record<string, Promise<Blob>>) {}
   }
-
-  // write: what the phone clipboard does with the item
   const copySetup = (write?: (items: FakeClipboardItem[]) => Promise<void>) => {
-    const timers: (() => void)[] = []
     const written: string[] = []
-    const listeners: ((text: string) => void)[] = []
-    const sent: string[] = []
     const clipboard = {
-      readText: async () => '',
       write:
         write ||
         (async (items: FakeClipboardItem[]) => {
           written.push(await (await items[0].items['text/plain']).text())
         }),
     }
-    const methods = videoMethods(async () => '', undefined, {
-      ClipboardItem: FakeClipboardItem,
-      Blob,
-      navigator: { clipboard },
-      window: {
-        setTimeout: (fn: () => void) => timers.push(fn),
-        clearTimeout: () => {},
-      },
-    })
-    const ctx: Record<string, any> = {
-      inputEnabled: true,
-      touchNotice: null,
-      copyWrites: 0,
-      keyMap: (key: number) => key,
-      $client: {
-        sendData: (event: string, data: { key: number }) => sent.push(`${event} ${data.key.toString(16)}`),
-        on: (_: string, fn: (text: string) => void) => listeners.push(fn),
-        off: (_: string, fn: (text: string) => void) => listeners.splice(listeners.indexOf(fn), 1),
-      },
-    }
-    ctx.showTouchNotice = (text: string) => (ctx.touchNotice = text)
-    ctx.nextRemoteClipboard = () => methods.nextRemoteClipboard.call(ctx)
-    const copy = () => methods.copyToClipboard.call(ctx)
-    const remoteCopies = (text: string) => [...listeners].forEach((fn) => fn(text))
-    const timeout = () => timers.splice(0).forEach((fn) => fn())
-    return { ctx, copy, sent, written, remoteCopies, timeout, listeners }
+    const t = clipboardSetup({ ClipboardItem: FakeClipboardItem, Blob, navigator: { clipboard } })
+    return { ...t, written, copy: () => t.methods.copyToClipboard.call(t.ctx) }
   }
-  const settle = () => new Promise((done) => setTimeout(done, 20))
 
   test('sends Ctrl+C and writes the remote clipboard text to the phone', async () => {
     const t = copySetup()
     t.copy()
     expect(t.sent).toEqual(['keydown ffe3', 'keydown 63', 'keyup 63', 'keyup ffe3'])
-    t.remoteCopies('Order #1234')
+    t.remoteClipboard('Order #1234')
     await settle()
     expect(t.written).toEqual(['Order #1234'])
     expect(t.ctx.touchNotice).toBe('Copied')
     expect(t.listeners).toHaveLength(0)
     expect(t.ctx.copyWrites).toBe(0)
-  })
-
-  test('the clipboard sync does not write over a pending Copy', async () => {
-    const writes: string[] = []
-    const methods = videoMethods(async () => '', undefined, {
-      navigator: { clipboard: { writeText: async (text: string) => writes.push(text) } },
-    })
-    const ctx = { clipboard_write_available: true, copyWrites: 1, $accessor: { remote: { setClipboard: () => {} } } }
-    await methods.onClipboardChanged.call(ctx, 'copied text')
-    expect(writes).toEqual([])
-    ctx.copyWrites = 0
-    await methods.onClipboardChanged.call(ctx, 'copied text')
-    expect(writes).toEqual(['copied text'])
   })
 
   test('starts the clipboard write inside the tap', () => {
@@ -462,28 +484,54 @@ describe('touch copy', () => {
     await settle()
     expect(t.written).toEqual([])
     expect(t.ctx.touchNotice).toBe('Nothing was copied')
-    expect(t.listeners).toHaveLength(0)
+    expect(t.ctx.panel).toBe(null)
   })
 
-  test('explains a refused clipboard write', async () => {
+  test('a refused clipboard write opens the clipboard panel', async () => {
     const t = copySetup(async (items) => {
       await items[0].items['text/plain']
       throw new DOMException('denied', 'NotAllowedError')
     })
     t.copy()
-    t.remoteCopies('secret')
+    t.remoteClipboard('secret')
     await settle()
-    expect(t.ctx.touchNotice).toBe('Copying to this device was not allowed')
+    expect(t.ctx.panel).toContain('not allowed')
   })
 
-  test('without ClipboardItem it says so and sends nothing', () => {
-    const methods = videoMethods(async () => '', undefined, { ClipboardItem: undefined })
-    const sent: string[] = []
-    const ctx: Record<string, any> = { inputEnabled: true, $client: { sendData: (e: string) => sent.push(e) } }
-    ctx.showTouchNotice = (text: string) => (ctx.touchNotice = text)
-    methods.copyToClipboard.call(ctx)
-    expect(sent).toEqual([])
-    expect(ctx.touchNotice).toBe('Copying is not available here')
+  test('without ClipboardItem it copies on the remote and opens the clipboard panel', () => {
+    const t = clipboardSetup({ ClipboardItem: undefined })
+    t.methods.copyToClipboard.call(t.ctx)
+    expect(t.sent).toEqual(['keydown ffe3', 'keydown 63', 'keyup 63', 'keyup ffe3'])
+    expect(t.ctx.panel).toBe('Select the text and copy it')
+  })
+
+  test('the clipboard sync does not write over a pending Copy', async () => {
+    const writes: string[] = []
+    const methods = videoMethods(async () => '', undefined, {
+      navigator: { clipboard: { writeText: async (text: string) => writes.push(text) } },
+    })
+    const ctx = { clipboard_write_available: true, copyWrites: 1, $accessor: { remote: { setClipboard: () => {} } } }
+    await methods.onClipboardChanged.call(ctx, 'copied text')
+    expect(writes).toEqual([])
+    ctx.copyWrites = 0
+    await methods.onClipboardChanged.call(ctx, 'copied text')
+    expect(writes).toEqual(['copied text'])
+  })
+
+  test('Copy is offered after a drag selection and withdrawn by the next tap', () => {
+    const methods = videoMethods(async () => '')
+    const ctx: Record<string, any> = {
+      copyOffered: false,
+      pressedMouseButtons: new Set([1]),
+      remotePoint: (p: unknown) => p,
+      $client: { sendData: () => {} },
+    }
+    ctx.offerCopy = () => methods.offerCopy.call(ctx)
+    ctx.withdrawCopy = () => methods.withdrawCopy.call(ctx)
+    methods.onGestureDragEnd.call(ctx, { x: 1, y: 1 })
+    expect(ctx.copyOffered).toBe(true)
+    ctx.withdrawCopy()
+    expect(ctx.copyOffered).toBe(false)
   })
 })
 

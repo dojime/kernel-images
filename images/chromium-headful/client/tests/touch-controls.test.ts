@@ -151,15 +151,40 @@ describe('keyboard control', () => {
     expect(emitted).toEqual(['copy'])
   })
 
-  test('a tap on the paste button pastes, and its first touch over the stream also only wakes it', () => {
-    const band = control('bottom')
-    band.tap('paste')
-    expect(band.emitted).toEqual(['paste'])
-
+  test('the first touch on a faded copy button over the stream also only wakes it', () => {
     const overlay = control('overlay')
-    overlay.tap('paste')
+    overlay.tap('copy')
     expect(overlay.emitted).toEqual([])
-    overlay.tap('paste')
-    expect(overlay.emitted).toEqual(['paste'])
+    overlay.tap('copy')
+    expect(overlay.emitted).toEqual(['copy'])
+  })
+})
+
+describe('extra keys row', () => {
+  const script = parseComponent(readFileSync(new URL('../src/components/touch-keys.vue', import.meta.url), 'utf8'))
+    .script!.content
+  const compiled = ts.transpileModule(script, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, experimentalDecorators: true },
+  }).outputText
+  const exports: Record<string, any> = {}
+  const noDecorator = () => () => undefined
+  runInNewContext(compiled, {
+    exports,
+    require: () => ({ Vue: class {}, Component: () => (type: unknown) => type, Prop: noDecorator }),
+  })
+
+  test('has Esc, Tab, Ctrl, the arrows and Paste last, and reports what was pressed', () => {
+    const keys: { label: string }[] = exports.TOUCH_KEYS
+    expect(keys.map((k) => k.label)).toEqual(['Esc', 'Tab', 'Ctrl', 'Left', 'Up', 'Down', 'Right', 'Paste'])
+
+    const emitted: unknown[][] = []
+    const ctx = { ctrlLatched: false, $emit: (...args: unknown[]) => emitted.push(args) }
+    for (const label of ['Esc', 'Ctrl', 'Paste']) {
+      exports.default.prototype.press.call(
+        ctx,
+        keys.find((k) => k.label === label),
+      )
+    }
+    expect(emitted).toEqual([['key', 0xff1b], ['ctrl', true], ['paste']])
   })
 })

@@ -21,19 +21,15 @@
         <span v-if="mode === 'bottom'">{{ keyboardOpen ? 'Hide keyboard' : 'Keyboard' }}</span>
         <span v-else-if="keyboardOpen" class="short">Hide</span>
       </button>
-      <button class="control-button" data-role="copy" aria-label="Copy" @click.stop.prevent="run('copy')">
+      <button
+        v-if="copyOffered"
+        class="control-button"
+        data-role="copy"
+        aria-label="Copy"
+        @click.stop.prevent="run('copy')"
+      >
         <i class="fas fa-copy" />
         <span v-if="mode !== 'overlay'" :class="{ short: mode !== 'bottom' }">Copy</span>
-      </button>
-      <button
-        v-if="keyboardOpen"
-        class="control-button"
-        data-role="paste"
-        aria-label="Paste"
-        @click.stop.prevent="run('paste')"
-      >
-        <i class="fas fa-paste" />
-        <span v-if="mode !== 'overlay'" :class="{ short: mode !== 'bottom' }">Paste</span>
       </button>
     </div>
   </div>
@@ -130,9 +126,9 @@
     placeControl,
   } from '~/utils/touch-controls'
 
-  type ControlAction = 'toggle' | 'paste' | 'copy'
+  type ControlAction = 'toggle' | 'copy'
 
-  const ACTIONS: Record<string, ControlAction> = { 'keyboard-toggle': 'toggle', paste: 'paste', copy: 'copy' }
+  const ACTIONS: Record<string, ControlAction> = { 'keyboard-toggle': 'toggle', copy: 'copy' }
 
   const IDLE_FADE_MS = 3000
   const DRAG_SLOP = 6
@@ -150,6 +146,8 @@
     @Prop({ type: Object, required: true }) readonly position!: ControlPosition
     @Prop({ type: Object, required: true }) readonly safeArea!: SafeArea
     @Prop(Boolean) readonly keyboardOpen!: boolean
+    // shown for a while after a selection
+    @Prop(Boolean) readonly copyOffered!: boolean
     @Prop({ type: Number, default: 0 }) readonly areaWidth!: number
     @Prop({ type: Number, default: 0 }) readonly areaHeight!: number
     @Prop({ type: Number, default: 0 }) readonly keyboardInset!: number

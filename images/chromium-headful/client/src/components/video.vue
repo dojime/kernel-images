@@ -95,10 +95,18 @@
         :area-width="playerWidth"
         :area-height="playerHeight"
         :keyboard-inset="keyboardInset"
+        :copy-offered="copyOffered"
         @toggle="toggleMobileKeyboard"
         @move="onControlMove"
-        @paste="pasteFromClipboard"
         @copy="copyToClipboard"
+      />
+      <neko-touch-keys
+        v-if="showTouchKeys"
+        :top="touchKeysTop"
+        :ctrl-latched="ctrlLatched"
+        @key="pressTouchKey"
+        @ctrl="latchCtrl"
+        @paste="pasteFromClipboard"
       />
       <button
         v-if="zoomed && !hideControls"
@@ -110,7 +118,12 @@
       </button>
       <div v-if="touchNotice && !hideControls" class="touch-button touch-notice" role="status">{{ touchNotice }}</div>
       <neko-resolution ref="resolution" v-if="admin" />
-      <neko-clipboard ref="clipboard" v-if="hosting && (!clipboard_read_available || !clipboard_write_available)" />
+      <neko-clipboard
+        ref="clipboard"
+        v-if="hosting && (is_touch_device || !clipboard_read_available || !clipboard_write_available)"
+        :touch="is_touch_device"
+        @paste="pasteText"
+      />
     </div>
   </div>
 </template>
@@ -313,6 +326,7 @@
   import Resolution from './resolution.vue'
   import Clipboard from './clipboard.vue'
   import TouchControls from './touch-controls.vue'
+  import TouchKeys, { TOUCH_KEYS_HEIGHT } from './touch-keys.vue'
 
   // @ts-ignore
   import GuacamoleKeyboard from '~/utils/guacamole-keyboard.ts'
@@ -326,6 +340,10 @@
   const TOUCH_NOTICE_MS = 3000
   // how long Copy waits for the remote clipboard to change after Ctrl+C
   const COPY_WAIT_MS = 2000
+  // how long Copy stays on the controls after a selection
+  const COPY_OFFER_MS = 8000
+  // pasted text up to this length is typed instead of pasted
+  const TYPED_PASTE_MAX = 32
   // kept in the overlay so soft keyboards that only emit input events still report backspace
   const INPUT_SENTINEL = ' '
 
@@ -338,6 +356,7 @@
       'neko-resolution': Resolution,
       'neko-clipboard': Clipboard,
       'neko-touch-controls': TouchControls,
+      'neko-touch-keys': TouchKeys,
     },
   })
   export default class extends Vue {
@@ -385,6 +404,11 @@
     // measured from the player's top, which the move keeps visible
     private keyboardPan = 0
     private keyboardAnchor: number | null = null
+    // the extra keys row's top, in the player's coordinates
+    private touchKeysTop = 0
+    private ctrlLatched = false
+    private copyOffered = false
+    private copyOfferTimer = 0
     private touchLayout: ControlLayout = { mode: 'overlay', band: 0 }
     private controlPosition: ControlPosition = decodePosition(get<string>(CONTROL_POSITION_KEY, ''))
     private playerWidth = 0
@@ -536,6 +560,10 @@
       return value === 'always' || value === 'off' ? value : 'auto'
     }
 
+    get showTouchKeys() {
+      return this.keyboardOpen && this.showTouchControls
+    }
+
     get inputEnabled() {
       return this.hosting && !this.locked
     }
@@ -680,6 +708,7 @@
         },
         () => this.is_touch_device,
       )
+      this.textInput.onCtrlLatch = (latched) => (this.ctrlLatched = latched)
       // only touch input reads the cursor shape
       if (this.is_touch_device) this.$client.on('cursor', this.onCursorImage)
 
@@ -786,6 +815,7 @@
       this.tapKeyboard.cancel()
       this.$client.off('cursor', this.onCursorImage)
       window.clearTimeout(this.touchNoticeTimer)
+      window.clearTimeout(this.copyOfferTimer)
       if (this.safeAreaProbe) this.safeAreaProbe.remove()
       if (this._wheelHandler) {
         document.removeEventListener('wheel', this._wheelHandler, { capture: true })
@@ -936,8 +966,8 @@
       this._resolution.open(event)
     }
 
-    openClipboard() {
-      this._clipboard.open()
+    openClipboard(hint?: string) {
+      if (this._clipboard) this._clipboard.open(hint)
     }
 
     async syncClipboard() {
@@ -1056,6 +1086,8 @@
       const here = this.remotePoint(p)
       this.clickAt(here, 1)
       this.keyboardAnchor = p.y - this._player.getBoundingClientRect().top
+      // the click clears the remote selection
+      this.withdrawCopy()
       this.tapKeyboard.tap(here, this.remotePerClient())
       if (this.keyboardOpen) this.updateKeyboardView()
     }
@@ -1083,6 +1115,19 @@
       this.$client.sendData('mousemove', this.remotePoint(p))
       this.pressedMouseButtons.delete(1)
       this.$client.sendData('mouseup', { key: 1 })
+      this.offerCopy()
+    }
+
+    // a long-press drag usually selects text, so Copy shows on the controls for a while
+    offerCopy() {
+      this.copyOffered = true
+      window.clearTimeout(this.copyOfferTimer)
+      this.copyOfferTimer = window.setTimeout(this.withdrawCopy, COPY_OFFER_MS)
+    }
+
+    withdrawCopy() {
+      window.clearTimeout(this.copyOfferTimer)
+      this.copyOffered = false
     }
 
     onGestureScroll(dx: number, dy: number) {
@@ -1172,25 +1217,65 @@
       }
     }
 
-    // The Paste control reads the phone's clipboard inside the tap, where
-    // Safari allows it after the user confirms, and types the text, so it
-    // needs no remote clipboard and works in fields that block pasting.
+    // The Paste key reads the phone's clipboard inside the tap, where Safari
+    // allows it after the user confirms. Where it cannot, the clipboard panel
+    // takes the text instead.
     pasteFromClipboard() {
       if (!navigator.clipboard || !navigator.clipboard.readText) {
-        this.showTouchNotice('Pasting is not available here')
+        this.openClipboard('Paste here, then tap Paste into page')
         return
       }
       navigator.clipboard.readText().then(
         (text) => {
-          if (!this.inputEnabled) return
           if (text) {
-            this.textInput.paste(text)
+            this.pasteText(text)
           } else {
             this.showTouchNotice('The clipboard is empty')
           }
         },
-        () => this.showTouchNotice('Clipboard access was not allowed'),
+        () => this.openClipboard('Clipboard access was not allowed. Paste here, then tap Paste into page'),
       )
+    }
+
+    // Short text is typed, which also works in fields that block pasting and in
+    // code fields with one box per character. Longer text goes through the
+    // remote clipboard and Ctrl+V, as a desktop paste does, once the remote
+    // confirms the clipboard; without that it is typed.
+    pasteText(text: string) {
+      text = text.replace(/[\r\n]+$/, '')
+      if (!text || !this.inputEnabled) return
+      if (text.length <= TYPED_PASTE_MAX && !/[\r\n]/.test(text)) {
+        this.textInput.paste(text)
+        return
+      }
+      this.nextRemoteClipboard()
+        .then((remote) => {
+          if (remote !== text) throw new Error('the remote clipboard holds other text')
+          if (this.inputEnabled) this.pressShortcut(0x0076)
+        })
+        .catch(() => {
+          if (this.inputEnabled) this.textInput.paste(text)
+        })
+      this.$accessor.remote.setClipboard(text)
+      this.$accessor.remote.sendClipboard(text)
+    }
+
+    // Ctrl and a letter key, mapped for the remote keyboard
+    pressShortcut(keysym: number) {
+      const ctrl = this.keyMap(0xffe3)
+      const key = this.keyMap(keysym)
+      this.$client.sendData('keydown', { key: ctrl })
+      this.$client.sendData('keydown', { key })
+      this.$client.sendData('keyup', { key })
+      this.$client.sendData('keyup', { key: ctrl })
+    }
+
+    pressTouchKey(keysym: number) {
+      if (this.inputEnabled) this.textInput.key(keysym)
+    }
+
+    latchCtrl(latched: boolean) {
+      this.textInput.latchCtrl(latched)
     }
 
     // The Copy control copies the remote selection to the phone. Safari only
@@ -1200,7 +1285,9 @@
     copyToClipboard() {
       if (!this.inputEnabled) return
       if (typeof ClipboardItem === 'undefined' || !navigator.clipboard || !navigator.clipboard.write) {
-        this.showTouchNotice('Copying is not available here')
+        // the panel shows the remote clipboard once Ctrl+C updates it
+        this.pressShortcut(0x0063)
+        this.openClipboard('Select the text and copy it')
         return
       }
 
@@ -1214,16 +1301,17 @@
         .write([new ClipboardItem({ 'text/plain': text })])
         .then(
           () => this.showTouchNotice('Copied'),
-          () => this.showTouchNotice(copied ? 'Copying to this device was not allowed' : 'Nothing was copied'),
+          () => {
+            if (copied) {
+              this.openClipboard('Copying to this device was not allowed. Select the text and copy it')
+            } else {
+              this.showTouchNotice('Nothing was copied')
+            }
+          },
         )
         .then(() => this.copyWrites--)
 
-      const ctrl = this.keyMap(0xffe3)
-      const c = this.keyMap(0x0063)
-      this.$client.sendData('keydown', { key: ctrl })
-      this.$client.sendData('keydown', { key: c })
-      this.$client.sendData('keyup', { key: c })
-      this.$client.sendData('keyup', { key: ctrl })
+      this.pressShortcut(0x0063)
     }
 
     // the remote clipboard text from the next update, rejected if none comes in time
@@ -1283,7 +1371,10 @@
       const area = (!this.fullscreen ? this._component : document.body).getBoundingClientRect()
       const viewport = window.visualViewport
       const visibleTop = viewport ? Math.max(area.top, viewport.offsetTop) : area.top
-      const visibleBottom = viewport ? Math.min(area.bottom, viewport.offsetTop + viewport.height) : area.bottom
+      // the extra keys row sits on the keyboard, so the video stays above both
+      const visibleBottom =
+        (viewport ? Math.min(area.bottom, viewport.offsetTop + viewport.height) : area.bottom) -
+        (this.showTouchKeys ? TOUCH_KEYS_HEIGHT : 0)
       // the layout position, which the pan transform (mid-transition, too) does not move
       const parent = this._player.offsetParent
       const top = (parent ? parent.getBoundingClientRect().top : 0) + this._player.offsetTop
@@ -1304,6 +1395,7 @@
         this._player.style.transform = pan ? `translateY(${-pan}px)` : ''
       }
       this.keyboardInset = Math.max(0, Math.round(top + height - pan - visibleBottom))
+      this.touchKeysTop = Math.round(visibleBottom - (top - pan))
     }
 
     toggleMobileKeyboard() {
@@ -1455,10 +1547,10 @@
       if (!this.hosting || this.locked) return
 
       try {
-        // On touch devices pasted text is typed, the same as the Paste control
+        // on touch devices a native paste goes the same way as the Paste key
         if (this.is_touch_device) {
           const text = event.clipboardData?.getData('text/plain')
-          if (text) this.textInput.paste(text)
+          if (text) this.pasteText(text)
           return
         }
 
@@ -1507,6 +1599,7 @@
     }
 
     onOverlayBlur() {
+      if (this.ctrlLatched) this.textInput.latchCtrl(false)
       this.tapKeyboard.blur()
       this._overlay.removeAttribute('inputmode')
       this.keyboardOpen = false

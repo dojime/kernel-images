@@ -7,6 +7,7 @@ import {
   TextInput,
   XK_BACKSPACE,
   XK_CAPS_LOCK,
+  XK_CONTROL_L,
   XK_RETURN,
   XK_SHIFT_L,
   XK_SHIFT_R,
@@ -145,6 +146,33 @@ describe('soft keyboard text', () => {
     input.keyEvent(false)
     input.input('insertText', 'a')
     expect(remote.text).toBe('aa')
+  })
+
+  test('a latched Ctrl holds for the next key only, from any path', () => {
+    const { input, remote } = setup()
+    const latches: boolean[] = []
+    input.onCtrlLatch = (latched) => latches.push(latched)
+    input.latchCtrl(true)
+    input.input('insertText', 'c')
+    input.input('insertText', 'd')
+    expect(remote.keys).toEqual([XK_CONTROL_L, 0x63, -0x63, -XK_CONTROL_L, 0x64, -0x64])
+    expect(latches).toEqual([true, false])
+
+    remote.keys.length = 0
+    input.latchCtrl(true)
+    // a soft Shift from the Guacamole keyboard does not use up the latch
+    input.keyDown(XK_SHIFT_L)
+    input.keyUp(XK_SHIFT_L)
+    input.key(0xff09)
+    expect(remote.keys).toEqual([XK_SHIFT_L, -XK_SHIFT_L, XK_CONTROL_L, 0xff09, -0xff09, -XK_CONTROL_L])
+  })
+
+  test('an unlatched Ctrl sends nothing', () => {
+    const { input, remote } = setup()
+    input.latchCtrl(true)
+    input.latchCtrl(false)
+    input.key(0xff1b)
+    expect(remote.keys).toEqual([0xff1b, -0xff1b])
   })
 
   test('types pasted text without its trailing line break', () => {
