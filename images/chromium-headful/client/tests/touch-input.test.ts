@@ -1,14 +1,18 @@
 import { describe, expect, test } from 'bun:test'
 import {
   charToKeysym,
+  keysymCase,
   keysymNeedsShift,
   needsShift,
   textDiff,
   TextInput,
   XK_BACKSPACE,
+  XK_CAPS_LOCK,
   XK_RETURN,
   XK_SHIFT_L,
+  XK_SHIFT_R,
 } from '../src/utils/text-input'
+import createKeyboard from '../src/utils/guacamole-keyboard'
 import { ZoomPan } from '../src/utils/zoom-pan'
 import { GestureHandlers, Point, TouchGestures } from '../src/utils/touch-gestures'
 
@@ -37,111 +41,263 @@ describe('text input', () => {
   })
 })
 
+// The remote X server as far as typing goes: Shift held, Caps Lock toggled by
+// its key, and a letter's case from Shift xor Caps Lock (neko maps a keysym to
+// its key, so the keysym's own case does not matter).
+function remoteX() {
+  const keys: number[] = []
+  const shift = new Set<number>()
+  let capsLock = false
+  let text = ''
+  const sink = (event: 'keydown' | 'keyup', key: number) => {
+    keys.push(event === 'keydown' ? key : -key)
+    if (key === XK_SHIFT_L || key === XK_SHIFT_R) {
+      if (event === 'keydown') shift.add(key)
+      else shift.delete(key)
+      return
+    }
+    if (event === 'keyup') return
+    if (key === XK_CAPS_LOCK) capsLock = !capsLock
+    else if (key === XK_BACKSPACE) text = text.slice(0, -1)
+    else if (key === XK_RETURN) text += '\n'
+    else if (keysymCase(key)) {
+      const ch = String.fromCodePoint(key & 0x00ffffff)
+      text += shift.size > 0 !== capsLock ? ch.toUpperCase() : ch.toLowerCase()
+    } else if (key < 0x100) text += String.fromCharCode(key)
+  }
+  return {
+    sink,
+    keys,
+    get text() {
+      return text
+    },
+    get capsLock() {
+      return capsLock
+    },
+    setCapsLock: (on: boolean) => (capsLock = on),
+  }
+}
+
 describe('soft keyboard text', () => {
-  const A = 0x41
   const setup = (touch = true) => {
-    const sent: string[] = []
-    let shift = false
-    const name = (key: number) =>
-      key === XK_SHIFT_L
-        ? 'Shift'
-        : key === XK_BACKSPACE
-        ? 'BS'
-        : key === XK_RETURN
-        ? 'Enter'
-        : String.fromCharCode(key)
+    const remote = remoteX()
     const input = new TextInput(
-      (event, key) => sent.push(`${event === 'keydown' ? '+' : '-'}${name(key)}`),
-      () => shift,
+      remote.sink,
       () => touch,
+      () => remote.capsLock,
     )
-    return { input, sent, holdShift: (held: boolean) => (shift = held) }
+    return { input, remote }
   }
 
   test('text from a key event is not typed again by its input event', () => {
-    const { input, sent } = setup()
+    const { input, remote } = setup()
+    // the Guacamole keyboard on iOS releases a key right after pressing it
     input.keyDown(0x61)
-    input.input('insertText', 'a')
     input.keyUp(0x61)
+    input.input('insertText', 'a')
+    input.keyEvent(true)
     // a keyboard that reports keyCode 229 sends only the input event
     input.input('insertText', 'b')
-    expect(sent).toEqual(['+a', '-a', '+b', '-b'])
+    expect(remote.text).toBe('ab')
   })
 
   test('a key without text does not swallow the next input event', () => {
-    const { input, sent } = setup()
+    const { input, remote } = setup()
     input.keyDown(0xff51)
     input.keyUp(0xff51)
+    input.keyEvent(true)
     input.input('insertText', 'x')
-    expect(sent.slice(-2)).toEqual(['+x', '-x'])
+    expect(remote.text).toBe('x')
+  })
+
+  test('a soft Shift does not swallow the next input event', () => {
+    const { input, remote } = setup()
+    input.keyDown(XK_SHIFT_L)
+    input.keyUp(XK_SHIFT_L)
+    input.input('insertReplacementText', 'Hi')
+    expect(remote.text).toBe('Hi')
   })
 
   test('types line breaks and backspace from input events', () => {
-    const { input, sent } = setup()
-    input.input('insertLineBreak', null)
+    const { input, remote } = setup()
+    input.input('insertText', 'ab')
     input.input('deleteContentBackward', null)
-    expect(sent).toEqual(['+Enter', '-Enter', '+BS', '-BS'])
+    input.input('insertLineBreak', null)
+    expect(remote.text).toBe('a\n')
   })
 
   test('types composition updates as edits and ignores the echo after compositionend', () => {
-    const { input, sent } = setup()
+    const { input, remote } = setup()
     input.compositionStart()
     input.input('insertCompositionText', 'te')
     input.input('insertCompositionText', 'tez')
     input.input('insertCompositionText', 'te')
     input.compositionEnd('tea', true)
     input.input('insertText', 'tea')
-    expect(sent.join(' ')).toBe('+t -t +e -e +z -z +BS -BS +a -a')
+    expect(remote.text).toBe('tea')
+    expect(remote.keys.filter((k) => k === XK_BACKSPACE)).toHaveLength(1)
     expect(input.composing).toBe(false)
 
     // only the event right after compositionend is an echo
     input.input('insertText', 'tea')
-    expect(sent.slice(-6).join(' ')).toBe('+t -t +e -e +a -a')
+    expect(remote.text).toBe('teatea')
   })
 
   test('a key event ends the window for a composition echo', () => {
-    const { input, sent } = setup()
+    const { input, remote } = setup()
     input.compositionStart()
     input.compositionEnd('a', true)
     input.keyEvent(false)
     input.input('insertText', 'a')
-    expect(sent).toEqual(['+a', '-a', '+a', '-a'])
+    expect(remote.text).toBe('aa')
   })
 
   test('drops composed text while input is disabled', () => {
-    const { input, sent } = setup()
+    const { input, remote } = setup()
     input.compositionStart()
     input.compositionEnd('hi', false)
-    expect(sent).toEqual([])
+    expect(remote.keys).toEqual([])
   })
 
-  test('sends Shift around capitals from a soft keyboard', () => {
-    const { input, sent } = setup()
-    input.keyDown(A)
-    input.keyUp(A)
-    input.input('insertText', 'B')
-    expect(sent.join(' ')).toBe('+Shift +A -A -Shift +Shift +B -B -Shift')
-  })
-
-  test('does not send Shift under Caps Lock or a held Shift', () => {
-    const { input, sent, holdShift } = setup()
+  test('sends Shift around capitals', () => {
+    const { input, remote } = setup()
+    input.keyDown(0x41)
+    input.keyUp(0x41)
     input.keyEvent(true)
-    input.keyDown(A)
-    input.keyUp(A)
-    input.input('insertText', 'B')
-    input.keyEvent(false)
-    holdShift(true)
-    input.keyDown(A)
-    input.keyUp(A)
-    expect(sent.join(' ')).toBe('+A -A +B -B +A -A')
+    input.input('insertText', 'Bc')
+    expect(remote.text).toBe('ABc')
+    expect(remote.keys.slice(0, 4)).toEqual([XK_SHIFT_L, 0x41, -0x41, -XK_SHIFT_L])
   })
 
-  test('never adds Shift for a desktop keyboard', () => {
-    const { input, sent } = setup(false)
-    input.keyDown(A, 0x1234)
-    input.keyUp(A, 0x1234)
-    expect(sent).toEqual([`+${String.fromCharCode(0x1234)}`, `-${String.fromCharCode(0x1234)}`])
+  test('never sends Caps Lock from a touch device, and types the right case under a remote Caps Lock', () => {
+    const { input, remote } = setup()
+    input.keyDown(XK_CAPS_LOCK)
+    input.keyUp(XK_CAPS_LOCK)
+    expect(remote.keys).toEqual([])
+
+    remote.setCapsLock(true)
+    input.input('insertText', 'Hi')
+    expect(remote.text).toBe('Hi')
+    expect(remote.capsLock).toBe(true)
   })
+
+  test('a Shift held on the remote types capitals without another Shift', () => {
+    const { input, remote } = setup()
+    input.keyDown(XK_SHIFT_L)
+    input.keyDown(0x41)
+    input.keyUp(0x41)
+    input.keyUp(XK_SHIFT_L)
+    expect(remote.text).toBe('A')
+    expect(remote.keys.filter((k) => k === XK_SHIFT_L)).toHaveLength(1)
+  })
+
+  test('sends desktop keys as they are, Caps Lock included', () => {
+    const { input, remote } = setup(false)
+    input.keyDown(XK_CAPS_LOCK)
+    input.keyUp(XK_CAPS_LOCK)
+    input.keyDown(0x41, 0x41)
+    input.keyUp(0x41, 0x41)
+    expect(remote.keys).toEqual([XK_CAPS_LOCK, -XK_CAPS_LOCK, 0x41, -0x41])
+  })
+})
+
+// The events iOS Safari sends for its soft keyboard, replayed through the real
+// Guacamole keyboard wired to TextInput as the live view wires them. WebKit
+// reports the keyboard's Shift and Caps Lock state changes as synthetic key
+// events with no text (WKSyntheticFlagsChangedWebEvent), and the Guacamole
+// keyboard treats every keyup on iOS as unreliable. The modifier flags on the
+// letter events themselves are not documented, so every combination is tried.
+describe('iOS soft keyboard', () => {
+  const ios = () => {
+    const saved = Object.getOwnPropertyDescriptor(navigator, 'platform')!
+    Object.defineProperty(navigator, 'platform', { value: 'iPhone', configurable: true })
+    const remote = remoteX()
+    const input = new TextInput(
+      remote.sink,
+      () => true,
+      () => false,
+    )
+    const listeners: Record<string, ((e: unknown) => void)[]> = {}
+    const target = {
+      addEventListener: (type: string, fn: (e: unknown) => void) => (listeners[type] ||= []).push(fn),
+    }
+    const keyboard = createKeyboard(target as unknown as Element)
+    Object.defineProperty(navigator, 'platform', saved)
+    keyboard.onkeydown = (key) => {
+      input.keyDown(key)
+      return false
+    }
+    keyboard.onkeyup = (key) => input.keyUp(key)
+
+    // capture listeners (the Guacamole keyboard) run before the live view's own at the target
+    const fire = (type: string, init: Record<string, unknown>, modifiers: { shift?: boolean; caps?: boolean } = {}) => {
+      const e = {
+        type,
+        shiftKey: !!modifiers.shift,
+        ctrlKey: false,
+        altKey: false,
+        metaKey: false,
+        location: 0,
+        repeat: false,
+        preventDefault() {},
+        getModifierState: (name: string) =>
+          name === 'CapsLock' ? !!modifiers.caps : name === 'Shift' && !!modifiers.shift,
+        ...init,
+      }
+      for (const fn of listeners[type] || []) fn(e)
+      if (type === 'keydown' || type === 'keyup') input.keyEvent(type === 'keyup')
+    }
+    const flags = (key: 'Shift' | 'CapsLock', down: boolean) =>
+      fire(
+        down ? 'keydown' : 'keyup',
+        { key, keyCode: key === 'Shift' ? 16 : 20 },
+        {
+          shift: key === 'Shift' && down,
+          caps: key === 'CapsLock' && down,
+        },
+      )
+    const letter = (ch: string, modifiers: { shift?: boolean; caps?: boolean } = {}) => {
+      const code = ch.toUpperCase().charCodeAt(0)
+      fire('keydown', { key: ch, keyCode: code }, modifiers)
+      fire('keypress', { key: ch, keyCode: ch.charCodeAt(0), charCode: ch.charCodeAt(0) }, modifiers)
+      input.input('insertText', ch)
+      fire('keyup', { key: ch, keyCode: code }, modifiers)
+    }
+    return { remote, flags, letter }
+  }
+
+  const combos = [
+    { shift: false, caps: false },
+    { shift: false, caps: true },
+    { shift: true, caps: false },
+    { shift: true, caps: true },
+  ]
+
+  for (const modifiers of combos) {
+    test(`a Shift tap capitalizes one letter (letter flags ${JSON.stringify(modifiers)})`, () => {
+      const { remote, flags, letter } = ios()
+      flags('Shift', true)
+      letter('H', modifiers)
+      flags('Shift', false)
+      for (const ch of 'ello') letter(ch)
+      expect(remote.text).toBe('Hello')
+      expect(remote.capsLock).toBe(false)
+    })
+
+    test(`soft Caps Lock types capitals and leaves the remote Caps Lock alone (letter flags ${JSON.stringify(
+      modifiers,
+    )})`, () => {
+      const { remote, flags, letter } = ios()
+      flags('CapsLock', true)
+      letter('A', modifiers)
+      letter('B', modifiers)
+      flags('CapsLock', false)
+      letter('c')
+      expect(remote.text).toBe('ABc')
+      expect(remote.capsLock).toBe(false)
+      expect(remote.keys.some((k) => Math.abs(k) === XK_CAPS_LOCK)).toBe(false)
+    })
+  }
 })
 
 describe('zoom and pan', () => {

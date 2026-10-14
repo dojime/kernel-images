@@ -672,8 +672,12 @@
       )
       this.textInput = new TextInput(
         (event, key) => this.$client.sendData(event, { key }),
-        () => !!this.keyboard.modifiers.shift,
         () => this.is_touch_device,
+        // as last synchronized; touch input never changes it
+        () => {
+          const state = this.$accessor.remote.keyboardModifierState
+          return state !== -1 && (state & 1) === 1
+        },
       )
       // only touch input reads the cursor shape
       if (this.is_touch_device) this.$client.on('cursor', this.onCursorImage)
@@ -1245,7 +1249,7 @@
     }
 
     onOverlayKey(e: KeyboardEvent) {
-      this.textInput.keyEvent(e.getModifierState('CapsLock'))
+      this.textInput.keyEvent(e.type === 'keyup')
     }
 
     onCompositionStart() {
