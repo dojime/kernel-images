@@ -252,6 +252,36 @@ describe('tap keyboard on iOS', () => {
     expect(t.events).toEqual(['hold', 'release', 'hold', 'release', 'chip'])
   })
 
+  test('a field tap after a non-text tap raises the keyboard', () => {
+    const t = setup('auto')
+    t.tap(blank)
+    t.advance(100)
+    t.keyboard.cursor('other')
+    t.advance(800)
+    t.events.length = 0
+    t.advance(500)
+    t.tap(field)
+    t.advance(150)
+    t.keyboard.cursor('text')
+    expect(t.events).toEqual(['hold', 'raise-held'])
+  })
+
+  test('a possibly stale I-beam does not affect a later tap under it', () => {
+    const t = setup('auto')
+    t.tap(field)
+    t.advance(20)
+    t.tap({ x: field.x, y: field.y + 40 })
+    t.advance(30)
+    t.keyboard.cursor('text')
+    t.advance(800)
+    t.events.length = 0
+    // the I-beam is still showing and the next tap lands on the same field
+    t.advance(2000)
+    t.tap({ x: field.x + 60, y: field.y + 40 })
+    t.advance(800)
+    expect(t.events).toEqual(['hold', 'raise-held'])
+  })
+
   test('a tap after the previous cursor settled is not affected', () => {
     const t = setup('auto')
     t.tap(field)

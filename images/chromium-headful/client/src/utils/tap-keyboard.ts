@@ -61,6 +61,7 @@ export class TapKeyboard {
   // update can still be in flight when the pointer moves on, and the latest
   // text cursor arrived in that window.
   private staleUntil = -Infinity
+  // only says something about the touch it arrived during
   private cursorStale = false
   // remote position where a text cursor was last seen after a tap
   private textSpot: Point | null = null
@@ -81,7 +82,7 @@ export class TapKeyboard {
   // raise the keyboard during a scroll, pinch or drag.
   touchBegin() {
     this.touchBeganAt = this.clock.now()
-    if (this.state.name !== 'idle') this.staleUntil = this.touchBeganAt + CURSOR_WAIT_MS
+    if (this.state.name === 'waiting') this.staleUntil = this.touchBeganAt + CURSOR_WAIT_MS
     this.cancel()
   }
 
@@ -163,7 +164,7 @@ export class TapKeyboard {
     const state = this.state
     if (state.name !== 'waiting') return
     this.state = { name: 'idle' }
-    if (this.cursorKind === 'text' && this.cursorStale) {
+    if (this.cursorKind === 'text' && this.cursorStale && this.cursorChangedAt >= this.touchBeganAt) {
       // no later cursor settled it, so ask instead of guessing
       if (state.heldFocus) this.out.release()
       if (!this.out.keyboardOpen()) this.out.showChip(state.tap.p)
