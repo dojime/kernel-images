@@ -594,14 +594,14 @@ func (s *ApiService) applyResolutionAndConverge(ctx context.Context, width, heig
 }
 
 // setViewportViaCDP resizes the browser viewport using the CDP
-// Emulation.setDeviceMetricsOverride command. This is near-instant and does
-// not require restarting Chromium or Xvfb.
+// Browser.setContentsSize command. This is near-instant and does not require
+// restarting Chromium or Xvfb.
 func (s *ApiService) setViewportViaCDP(ctx context.Context, width, height int) error {
 	log := logger.FromContext(ctx)
 	if err := s.withCDPClient(ctx, func(cdpCtx context.Context, client *cdpclient.Client) error {
-		return client.SetDeviceMetricsOverride(cdpCtx, width, height)
+		return client.SetContentsSize(cdpCtx, width, height)
 	}); err != nil {
-		return fmt.Errorf("CDP setDeviceMetricsOverride: %w", err)
+		return fmt.Errorf("CDP setContentsSize: %w", err)
 	}
 	log.Info("viewport resized via CDP", "width", width, "height", height)
 	return nil

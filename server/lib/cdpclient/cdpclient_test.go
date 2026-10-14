@@ -16,18 +16,21 @@ import (
 )
 
 // fakeCDP is a minimal CDP server that responds to the commands used by
-// SetDeviceMetricsOverride and GetBrowserVersion.
+// SetContentsSize and GetBrowserVersion.
 type fakeCDP struct {
 	getTargetsCalls     int
 	attachCalled        bool
-	setMetricsCalled    bool
-	setMetricsWidth     int
-	setMetricsHeight    int
+	windowForTarget     string
+	setContentsCalled   bool
+	setContentsWindowID int
+	setContentsWidth    int
+	setContentsHeight   int
 	detachCalled        bool
 	pageTargetID        string
+	windowID            int
 	sessionID           string
 	failGetTargets      bool
-	failSetMetrics      bool
+	failSetContents     bool
 	returnNoPageTargets bool
 	noPageTargetsFor    int
 	getVersionCalled    bool
@@ -104,15 +107,24 @@ func (f *fakeCDP) handler(w http.ResponseWriter, r *http.Request) {
 		case "Target.attachToTarget":
 			f.attachCalled = true
 			result = map[string]string{"sessionId": f.sessionID}
-		case "Emulation.setDeviceMetricsOverride":
-			f.setMetricsCalled = true
-			if f.failSetMetrics {
-				cdpErr = &Error{Code: -2, Message: "metrics error"}
+		case "Browser.getWindowForTarget":
+			var params map[string]string
+			_ = json.Unmarshal(req.Params, &params)
+			f.windowForTarget = params["targetId"]
+			result = map[string]any{
+				"windowId": f.windowID,
+				"bounds":   map[string]any{"width": 800, "height": 600, "windowState": "normal"},
+			}
+		case "Browser.setContentsSize":
+			f.setContentsCalled = true
+			if f.failSetContents {
+				cdpErr = &Error{Code: -2, Message: "contents size error"}
 			} else {
 				var params map[string]any
 				_ = json.Unmarshal(req.Params, &params)
-				f.setMetricsWidth = int(params["width"].(float64))
-				f.setMetricsHeight = int(params["height"].(float64))
+				f.setContentsWindowID = int(params["windowId"].(float64))
+				f.setContentsWidth = int(params["width"].(float64))
+				f.setContentsHeight = int(params["height"].(float64))
 				result = map[string]any{}
 			}
 		case "Target.detachFromTarget":
@@ -189,11 +201,11 @@ func startFakeCDP(t *testing.T, f *fakeCDP) string {
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
 }
 
-func TestSetDeviceMetricsOverride(t *testing.T) {
+func TestSetContentsSize(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		f := &fakeCDP{
 			pageTargetID: "target-123",
-			sessionID:    "session-abc",
+			windowID:     7,
 		}
 		url := startFakeCDP(t, f)
 
@@ -202,15 +214,16 @@ func TestSetDeviceMetricsOverride(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
+		err = client.SetContentsSize(ctx, 1920, 1080)
 		require.NoError(t, err)
 
 		assert.Equal(t, 1, f.getTargetsCalls)
-		assert.True(t, f.attachCalled)
-		assert.True(t, f.setMetricsCalled)
-		assert.True(t, f.detachCalled)
-		assert.Equal(t, 1920, f.setMetricsWidth)
-		assert.Equal(t, 1080, f.setMetricsHeight)
+		assert.Equal(t, "target-123", f.windowForTarget)
+		assert.True(t, f.setContentsCalled)
+		assert.Equal(t, 7, f.setContentsWindowID)
+		assert.Equal(t, 1920, f.setContentsWidth)
+		assert.Equal(t, 1080, f.setContentsHeight)
+		assert.False(t, f.attachCalled)
 	})
 
 	t.Run("no page target", func(t *testing.T) {
@@ -232,18 +245,17 @@ func TestSetDeviceMetricsOverride(t *testing.T) {
 		defer client.Close()
 
 		start := time.Now()
-		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
+		err = client.SetContentsSize(ctx, 1920, 1080)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no page target found")
 		assert.NotErrorIs(t, err, context.DeadlineExceeded)
 		assert.GreaterOrEqual(t, time.Since(start), pageTargetWaitTimeout)
-		assert.False(t, f.attachCalled)
+		assert.False(t, f.setContentsCalled)
 	})
 
 	t.Run("waits for first page target", func(t *testing.T) {
 		f := &fakeCDP{
 			pageTargetID:     "target-123",
-			sessionID:        "session-abc",
 			noPageTargetsFor: 3,
 		}
 		url := startFakeCDP(t, f)
@@ -253,11 +265,11 @@ func TestSetDeviceMetricsOverride(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
+		err = client.SetContentsSize(ctx, 1920, 1080)
 		require.NoError(t, err)
 
 		assert.Equal(t, 4, f.getTargetsCalls)
-		assert.True(t, f.setMetricsCalled)
+		assert.True(t, f.setContentsCalled)
 	})
 
 	t.Run("no page target respects context", func(t *testing.T) {
@@ -277,7 +289,7 @@ func TestSetDeviceMetricsOverride(t *testing.T) {
 		time.AfterFunc(250*time.Millisecond, cancel)
 
 		start := time.Now()
-		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
+		err = client.SetContentsSize(ctx, 1920, 1080)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Less(t, time.Since(start), pageTargetWaitTimeout)
@@ -294,16 +306,15 @@ func TestSetDeviceMetricsOverride(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetDeviceMetricsOverride(ctx, 1920, 1080)
+		err = client.SetContentsSize(ctx, 1920, 1080)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "Target.getTargets")
 	})
 
-	t.Run("setDeviceMetrics failure", func(t *testing.T) {
+	t.Run("setContentsSize failure", func(t *testing.T) {
 		f := &fakeCDP{
-			pageTargetID:   "target-123",
-			sessionID:      "session-abc",
-			failSetMetrics: true,
+			pageTargetID:    "target-123",
+			failSetContents: true,
 		}
 		url := startFakeCDP(t, f)
 
@@ -312,9 +323,9 @@ func TestSetDeviceMetricsOverride(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		err = client.SetDeviceMetricsOverride(ctx, 800, 600)
+		err = client.SetContentsSize(ctx, 800, 600)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "Emulation.setDeviceMetricsOverride")
+		assert.Contains(t, err.Error(), "Browser.setContentsSize")
 	})
 
 	t.Run("context cancellation", func(t *testing.T) {

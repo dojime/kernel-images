@@ -226,10 +226,10 @@ func waitForRendererViewport(t *testing.T, ctx context.Context, c *TestContainer
 }
 
 // headlessViewportPredicate asserts innerWidth/innerHeight match the request.
-// In --headless=new the renderer uses Chrome's internal window
-// (Emulation.setDeviceMetricsOverride drives inner*) — screen.* and outer*
-// stay at Chrome's startup defaults and do not move on resize, so they are
-// intentionally not asserted.
+// In --headless=new the renderer uses Chrome's internal window, which the
+// server sizes around the page (Browser.setContentsSize drives inner*) —
+// screen.* stays at Chrome's startup default and outer* includes the window
+// frame, so they are intentionally not asserted.
 func headlessViewportPredicate(v rendererViewport, wantW, wantH int) bool {
 	return v.InnerWidth == wantW && v.InnerHeight == wantH
 }
