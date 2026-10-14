@@ -126,6 +126,10 @@ before falling back to the base response. Capture remains best-effort when Chrom
 omits events or a target disconnects. Redirects emit a response for each hop,
 without a body. Request IDs remain the same across a redirect chain.
 
+Responses, failures, and proxy errors for tracked requests publish after their
+request event. Header correlation stays active for pending redirect responses
+after the final request completes or fails, until their capture finishes.
+
 `network_response.status` is the wire status when available. `effective_status`
 is present when Chrome's effective response differs, such as wire 304 with an
 effective 200 and a cached body. `headers` contains the wire response headers when

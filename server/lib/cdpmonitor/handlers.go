@@ -595,7 +595,9 @@ func (m *Monitor) handleResponseReceived(p cdpNetworkResponseReceivedParams, ses
 	if state.hop != nil {
 		source = state.hop.source
 	}
-	m.publishProxyError(source, sessionID, p.RequestID, code, p.Response.Status, navSeq, method, resType, url, frame, loader)
+	m.publishAfterNetworkRequest(state.hop, func() {
+		m.publishProxyError(source, sessionID, p.RequestID, code, p.Response.Status, navSeq, method, resType, url, frame, loader)
+	})
 }
 
 func (m *Monitor) handleLoadingFinished(ctx context.Context, p cdpNetworkLoadingFinishedParams, sessionID string) {
@@ -689,7 +691,9 @@ func (m *Monitor) handleLoadingFailed(p cdpNetworkLoadingFailedParams, sessionID
 	if state.hop != nil {
 		source = state.hop.source
 	}
-	m.publishEvent(EventNetworkLoadingFailed, events.Network, source, "Network.loadingFailed", data, sessionID)
+	m.publishAfterNetworkRequest(state.hop, func() {
+		m.publishEvent(EventNetworkLoadingFailed, events.Network, source, "Network.loadingFailed", data, sessionID)
+	})
 
 	if ok {
 		m.finishNetworkRequest(state)

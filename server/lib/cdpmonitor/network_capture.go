@@ -21,11 +21,12 @@ const (
 // request IDs; only hops whose response advertises ExtraInfo consume those queues.
 // All exchange and hop fields are protected by pendReqMu.
 type networkExchange struct {
-	addedAt   time.Time
-	hops      []*networkHop
-	requests  []json.RawMessage
-	responses []cdpNetworkResponseReceivedExtraInfoParams
-	failed    bool
+	addedAt      time.Time
+	hops         []*networkHop
+	requests     []json.RawMessage
+	responses    []cdpNetworkResponseReceivedExtraInfoParams
+	terminal     bool
+	publications int // request/response publishers still using this exchange
 }
 
 type networkHop struct {
@@ -40,7 +41,7 @@ type networkHop struct {
 	responseReady    chan struct{}
 	requestMatched   bool
 	responseMatched  bool
-	requestPublished bool
+	requestPublished chan struct{}
 }
 
 func (m *Monitor) exchangeLocked(key networkRequestKey) *networkExchange {
@@ -56,13 +57,15 @@ func (m *Monitor) queueNetworkRequestLocked(key networkRequestKey, request oapi.
 	e := m.exchangeLocked(key)
 	metadata := targetMetadata(info)
 	h := &networkHop{
-		exchange:      e,
-		request:       request,
-		source:        oapi.BrowserEventSource{Kind: oapi.Cdp, Metadata: &metadata},
-		requestReady:  make(chan struct{}),
-		responseReady: make(chan struct{}),
+		exchange:         e,
+		request:          request,
+		source:           oapi.BrowserEventSource{Kind: oapi.Cdp, Metadata: &metadata},
+		requestReady:     make(chan struct{}),
+		responseReady:    make(chan struct{}),
+		requestPublished: make(chan struct{}),
 	}
 	e.hops = append(e.hops, h)
+	e.publications++
 	return h
 }
 
@@ -108,15 +111,26 @@ func (m *Monitor) resolveFailedHeadersLocked(h *networkHop) {
 	if h == nil {
 		return
 	}
-	h.exchange.failed = true
+	h.exchange.terminal = true
 	// CORS failures can have ExtraInfo without a responseReceived event.
 	if !h.known {
 		h.known, h.hasExtra = true, true
 	}
 	h.exchange.matchHeaders()
-	if h.requestPublished {
-		delete(m.networkExchanges, networkRequestKey{h.request.SessionId, h.request.RequestId})
+	m.cleanupNetworkExchangeLocked(networkRequestKey{h.request.SessionId, h.request.RequestId}, h.exchange)
+}
+
+func (m *Monitor) cleanupNetworkExchangeLocked(key networkRequestKey, e *networkExchange) {
+	if e.terminal && e.publications == 0 && m.networkExchanges[key] == e {
+		delete(m.networkExchanges, key)
 	}
+}
+
+func (m *Monitor) finishNetworkPublication(key networkRequestKey, e *networkExchange) {
+	m.pendReqMu.Lock()
+	defer m.pendReqMu.Unlock()
+	e.publications--
+	m.cleanupNetworkExchangeLocked(key, e)
 }
 
 func (e *networkExchange) matchHeaders() {
@@ -171,6 +185,8 @@ func waitNetworkHeaders(ctx context.Context, ready ...<-chan struct{}) {
 
 func (m *Monitor) publishNetworkRequest(ctx context.Context, key networkRequestKey, h *networkHop) {
 	m.telemetryWg.Go(func() {
+		defer m.finishNetworkPublication(key, h.exchange)
+		defer close(h.requestPublished)
 		waitNetworkHeaders(ctx, h.requestReady)
 		m.pendReqMu.Lock()
 		payload := h.request
@@ -178,27 +194,48 @@ func (m *Monitor) publishNetworkRequest(ctx context.Context, key networkRequestK
 			payload.Headers = nil
 			_ = json.Unmarshal(h.requestHeaders, &payload.Headers)
 		}
-		h.requestPublished = true
-		if h.exchange.failed && m.networkExchanges[key] == h.exchange {
-			delete(m.networkExchanges, key)
-		}
 		m.pendReqMu.Unlock()
 		data, _ := json.Marshal(payload)
 		m.publishEvent(EventNetworkRequest, events.Network, h.source, "Network.requestWillBeSent", data, key.sessionID)
 	})
 }
 
-func (m *Monitor) emitNetworkResponse(ctx context.Context, key networkRequestKey, state networkReqState, info targetInfo, redirect bool) {
+// The request publisher always drains, including on cancellation. Wait for its
+// publication, not just header readiness, to preserve per-request event order.
+func (m *Monitor) publishAfterNetworkRequest(h *networkHop, publish func()) {
+	if h == nil {
+		publish()
+		return
+	}
 	m.telemetryWg.Go(func() {
+		<-h.requestPublished
+		publish()
+	})
+}
+
+func (m *Monitor) emitNetworkResponse(ctx context.Context, key networkRequestKey, state networkReqState, info targetInfo, redirect bool) {
+	h := state.hop
+	if h != nil {
+		m.pendReqMu.Lock()
+		h.exchange.publications++
+		if !redirect {
+			h.exchange.terminal = true
+		}
+		m.pendReqMu.Unlock()
+	}
+	m.telemetryWg.Go(func() {
+		if h != nil {
+			defer m.finishNetworkPublication(key, h.exchange)
+		}
 		// Fetch before waiting for ExtraInfo so header ordering cannot delay retrieval.
 		var body string
 		var bodyErr error
 		if !redirect {
 			body, bodyErr = m.fetchResponseBody(ctx, key.requestID, key.sessionID, state)
 		}
-		h := state.hop
 		if h != nil {
 			waitNetworkHeaders(ctx, h.requestReady, h.responseReady)
+			<-h.requestPublished
 		}
 		var headers oapi.BrowserHttpHeaders
 		_ = json.Unmarshal(state.resHeaders, &headers)
@@ -240,9 +277,6 @@ func (m *Monitor) emitNetworkResponse(ctx context.Context, key networkRequestKey
 					payload.EffectiveStatus = ptrOf(state.status)
 					payload.StatusText = optPtr(http.StatusText(payload.Status))
 				}
-			}
-			if !redirect && m.networkExchanges[key] == h.exchange {
-				delete(m.networkExchanges, key)
 			}
 			m.pendReqMu.Unlock()
 		}
