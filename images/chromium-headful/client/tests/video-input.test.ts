@@ -403,6 +403,7 @@ describe('touch copy', () => {
     const ctx: Record<string, any> = {
       inputEnabled: true,
       touchNotice: null,
+      copyWrites: 0,
       keyMap: (key: number) => key,
       $client: {
         sendData: (event: string, data: { key: number }) => sent.push(`${event} ${data.key.toString(16)}`),
@@ -428,6 +429,20 @@ describe('touch copy', () => {
     expect(t.written).toEqual(['Order #1234'])
     expect(t.ctx.touchNotice).toBe('Copied')
     expect(t.listeners).toHaveLength(0)
+    expect(t.ctx.copyWrites).toBe(0)
+  })
+
+  test('the clipboard sync does not write over a pending Copy', async () => {
+    const writes: string[] = []
+    const methods = videoMethods(async () => '', undefined, {
+      navigator: { clipboard: { writeText: async (text: string) => writes.push(text) } },
+    })
+    const ctx = { clipboard_write_available: true, copyWrites: 1, $accessor: { remote: { setClipboard: () => {} } } }
+    await methods.onClipboardChanged.call(ctx, 'copied text')
+    expect(writes).toEqual([])
+    ctx.copyWrites = 0
+    await methods.onClipboardChanged.call(ctx, 'copied text')
+    expect(writes).toEqual(['copied text'])
   })
 
   test('starts the clipboard write inside the tap', () => {

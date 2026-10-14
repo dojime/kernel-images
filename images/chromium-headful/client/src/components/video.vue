@@ -377,6 +377,8 @@
     private keyboardOpen = false
     private touchNotice: string | null = null
     private touchNoticeTimer = 0
+    // Copy control clipboard writes still waiting for their text
+    private copyWrites = 0
     private cursorSeq = 0
     private keyboardInset = 0
     // how far the video is moved up above the soft keyboard, and the last tap
@@ -630,7 +632,8 @@
 
     @Watch('clipboard')
     async onClipboardChanged(clipboard: string) {
-      if (this.clipboard_write_available) {
+      // a second write would replace the Copy control's pending one
+      if (this.clipboard_write_available && this.copyWrites === 0) {
         try {
           await navigator.clipboard.writeText(clipboard)
           this.$accessor.remote.setClipboard(clipboard)
@@ -1206,10 +1209,14 @@
         copied = true
         return new Blob([t], { type: 'text/plain' })
       })
-      navigator.clipboard.write([new ClipboardItem({ 'text/plain': text })]).then(
-        () => this.showTouchNotice('Copied'),
-        () => this.showTouchNotice(copied ? 'Copying to this device was not allowed' : 'Nothing was copied'),
-      )
+      this.copyWrites++
+      navigator.clipboard
+        .write([new ClipboardItem({ 'text/plain': text })])
+        .then(
+          () => this.showTouchNotice('Copied'),
+          () => this.showTouchNotice(copied ? 'Copying to this device was not allowed' : 'Nothing was copied'),
+        )
+        .then(() => this.copyWrites--)
 
       const ctrl = this.keyMap(0xffe3)
       const c = this.keyMap(0x0063)
