@@ -43,3 +43,106 @@ export function textDiff(prev: string, next: string) {
   while (common < a.length && common < b.length && a[common] === b[common]) common++
   return { deletes: a.length - common, insert: b.slice(common).join('') }
 }
+
+type KeySink = (event: 'keydown' | 'keyup', keysym: number) => void
+
+// The one path from keyboard input to X key events on touch devices: key events
+// from the Guacamole keyboard, and text that arrives only as input or
+// composition events. Shift is sent around keys that need it here, since soft
+// keyboards never report Shift and Caps Lock already gives the upper case.
+export class TextInput {
+  // from the last native key event; soft keyboards report it as off
+  capsLock = false
+  composing = false
+  private composed = ''
+  // a key event already sent the text the next input event reports
+  private keyed = false
+  // compositionend already sent this text, and some keyboards repeat it in an input event
+  private compositionEcho: string | null = null
+  private shiftWrapped = new Set<number>()
+
+  constructor(private send: KeySink, private shiftHeld: () => boolean, private touch: () => boolean) {}
+
+  // sent: the keysym after layout mapping
+  keyDown(keysym: number, sent = keysym) {
+    if (this.needsShift(keysym)) {
+      this.shiftWrapped.add(keysym)
+      this.send('keydown', XK_SHIFT_L)
+    }
+    this.send('keydown', sent)
+    this.keyed = true
+  }
+
+  keyUp(keysym: number, sent = keysym) {
+    this.keyed = false
+    this.send('keyup', sent)
+    if (this.shiftWrapped.delete(keysym)) this.send('keyup', XK_SHIFT_L)
+  }
+
+  // any native keydown or keyup on the overlay
+  keyEvent(capsLock: boolean) {
+    this.capsLock = capsLock
+    this.compositionEcho = null
+  }
+
+  input(inputType: string, data: string | null) {
+    const keyed = this.keyed
+    const echo = this.compositionEcho !== null && data === this.compositionEcho
+    this.keyed = false
+    this.compositionEcho = null
+
+    if (inputType === 'insertCompositionText') {
+      this.updateComposition(data || '')
+      return
+    }
+    if (keyed || echo) return
+
+    switch (inputType) {
+      case 'insertText':
+      case 'insertReplacementText':
+        this.type(data || '')
+        break
+      case 'insertLineBreak':
+      case 'insertParagraph':
+        this.press(XK_RETURN)
+        break
+      case 'deleteContentBackward':
+        this.press(XK_BACKSPACE)
+        break
+    }
+  }
+
+  compositionStart() {
+    this.composing = true
+    this.composed = ''
+    this.compositionEcho = null
+  }
+
+  // send: false when input is not enabled, so the text is dropped
+  compositionEnd(data: string, send: boolean) {
+    if (send) this.updateComposition(data)
+    this.compositionEcho = data
+    this.composing = false
+    this.composed = ''
+  }
+
+  private updateComposition(text: string) {
+    const { deletes, insert } = textDiff(this.composed, text)
+    for (let i = 0; i < deletes; i++) this.press(XK_BACKSPACE)
+    this.type(insert)
+    this.composed = text
+  }
+
+  private type(text: string) {
+    for (const ch of Array.from(text)) this.press(charToKeysym(ch))
+  }
+
+  private press(keysym: number) {
+    this.keyDown(keysym)
+    this.keyUp(keysym)
+  }
+
+  private needsShift(keysym: number) {
+    return this.touch() && keysymNeedsShift(keysym) && !this.shiftHeld() && !this.capsLock
+  }
+}

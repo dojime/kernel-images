@@ -11,6 +11,7 @@
       @touchmove.stop.prevent="onTouchMove"
       @touchend.stop.prevent="onTouchEnd"
       @touchcancel.stop.prevent="onTouchCancel"
+      @mousedown.prevent
       @click.stop.prevent="toggle"
     >
       <i class="fas fa-keyboard" />
@@ -77,11 +78,6 @@
     &.faded {
       opacity: 0.3;
     }
-
-    // over the stream a faded control lets taps through; any touch on the view wakes it
-    &.mode-overlay.faded {
-      pointer-events: none;
-    }
   }
 </style>
 
@@ -121,6 +117,8 @@
     private faded = false
     private fadeTimer = 0
     private touchStart: Point | null = null
+    // over the stream a faded control is easy to hit by accident, so its first touch only wakes it
+    private wakeOnly = false
     // finger offset from the control's top-left corner, so a drag does not jump
     private grab: Point = { x: 0, y: 0 }
     private dragPoint: Point | null = null
@@ -191,6 +189,7 @@
     }
 
     onTouchStart(e: TouchEvent) {
+      this.wakeOnly = this.faded && this.mode === 'overlay'
       this.wake()
       const p = this.localPoint(e.changedTouches[0])
       const corner = this.corner
@@ -209,7 +208,7 @@
     onTouchEnd() {
       if (!this.dragPoint) {
         this.touchStart = null
-        this.toggle()
+        if (!this.wakeOnly) this.toggle()
         return
       }
 

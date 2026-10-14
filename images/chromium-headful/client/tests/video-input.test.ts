@@ -172,3 +172,44 @@ describe('video input during read-only transitions', () => {
     methods.onMouseEnter.call({ hosting: true, locked: true }, {})
   })
 })
+
+describe('video touch input', () => {
+  const touchContext = (sent: string[]) => ({
+    zoomScale: 2,
+    remotePoint: (p: { x: number; y: number }) => p,
+    remotePerClient: () => 1,
+    $client: { sendData: (event: string, data: unknown) => sent.push(`${event} ${JSON.stringify(data)}`) },
+    tapKeyboard: { tap: () => {}, cancel: () => sent.push('keyboard cancel') },
+    gestures: { cancel: () => sent.push('gestures cancel') },
+    resetZoom: () => sent.push('reset zoom'),
+  })
+
+  test('a double tap while zoomed clicks twice and keeps the zoom', () => {
+    const methods = videoMethods(async () => '')
+    const sent: string[] = []
+    const ctx = {
+      ...touchContext(sent),
+      clickAt: (here: unknown, button: number) => methods.clickAt.call(ctx, here, button),
+    }
+    methods.onGestureTap.call(ctx, { x: 10, y: 20 })
+    methods.onGestureTap.call(ctx, { x: 12, y: 21 })
+    expect(sent).toEqual([
+      'mousemove {"x":10,"y":20}',
+      'mousedown {"key":1}',
+      'mouseup {"key":1}',
+      'mousemove {"x":12,"y":21}',
+      'mousedown {"key":1}',
+      'mouseup {"key":1}',
+    ])
+  })
+
+  test('losing input ends the touch gesture and the keyboard wait', () => {
+    const methods = videoMethods(async () => '')
+    const sent: string[] = []
+    const ctx = touchContext(sent)
+    methods.onInputEnabledChanged.call(ctx, true)
+    expect(sent).toEqual([])
+    methods.onInputEnabledChanged.call(ctx, false)
+    expect(sent).toEqual(['gestures cancel', 'keyboard cancel'])
+  })
+})

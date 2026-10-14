@@ -29,6 +29,8 @@
           @touchmove.stop.prevent="onTouchMove"
           @touchend.stop.prevent="onTouchEnd"
           @touchcancel.stop.prevent="onTouchCancel"
+          @keydown="onOverlayKey"
+          @keyup="onOverlayKey"
           @input="onOverlayInput"
           @compositionstart="onCompositionStart"
           @compositionend="onCompositionEnd"
@@ -105,7 +107,7 @@
         {{ zoomScale.toFixed(1) }}× · Reset
       </button>
       <button
-        v-if="typeChip"
+        v-if="typeChip && !hideControls"
         class="touch-button type-chip"
         :style="{ left: `${typeChip.x}px`, top: `${typeChip.y}px` }"
         @touchend.stop.prevent="onTypeChip"
@@ -308,16 +310,8 @@
   } from '~/utils/touch-controls'
   import { get, set } from '~/utils/localstorage'
   import { CursorImage, CursorKind, cachedCursorKind, classifyCursor } from '~/utils/cursor-shape'
-  import {
-    XK_BACKSPACE,
-    XK_RETURN,
-    XK_SHIFT_L,
-    charToKeysym,
-    focusNeedsGesture,
-    keysymNeedsShift,
-    needsShift,
-    textDiff,
-  } from '~/utils/text-input'
+  import { TextInput, focusNeedsGesture } from '~/utils/text-input'
+  import { TapKeyboard, TapKeyboardMode } from '~/utils/tap-keyboard'
 
   import Emote from './emote.vue'
   import Resolution from './resolution.vue'
@@ -333,25 +327,9 @@
 
   // wheel units per remote pixel of finger travel, so content tracks the finger
   const TOUCH_SCROLL_UNITS_PER_PX = 1.1
-  const DOUBLE_TAP_MS = 300
-  const DOUBLE_TAP_SLOP = 40
-  // how long after a tap a text cursor can still raise the keyboard
-  const CURSOR_WAIT_MS = 800
-  // a text cursor later than CURSOR_WAIT_MS but within this offers the "Tap to type" button
-  const CURSOR_LATE_MS = 2000
-  // remote px; pointer positions this close are the same spot
-  const CURSOR_SAME_SPOT = 16
-  // a tap this close (CSS px on screen) to where a text cursor was seen raises the keyboard
-  const TEXT_SPOT_RADIUS = 12
   const TYPE_CHIP_MS = 4000
   // kept in the overlay so soft keyboards that only emit input events still report backspace
   const INPUT_SENTINEL = ' '
-
-  function nearSpot(a: Point, b: Point) {
-    return Math.hypot(a.x - b.x, a.y - b.y) <= CURSOR_SAME_SPOT
-  }
-
-  type TapKeyboardMode = 'auto' | 'chip' | 'always' | 'off'
 
   const CONTROL_POSITION_KEY = 'touch_control_position'
 
@@ -394,20 +372,14 @@
     private isVideoSyncing = false
 
     private gestures!: TouchGestures
+    private tapKeyboard!: TapKeyboard
+    private textInput!: TextInput
     private zoom!: ZoomPan
     private zoomScale = 1
     private keyboardOpen = false
     private typeChip: Point | null = null
     private typeChipTimer = 0
-    private cursorKind: CursorKind = 'unknown'
-    private cursorChangedAt = 0
     private cursorSeq = 0
-    // remote pointer position: last sent, and where a text cursor was last seen
-    private pointer: Point | null = null
-    private textSpot: Point | null = null
-    // when the pointer last moved to a new spot, and the time before that
-    private pointerJumpAt = 0
-    private previousPointerJumpAt = 0
     private keyboardInset = 0
     private touchLayout: ControlLayout = { mode: 'overlay', band: 0 }
     private controlPosition: ControlPosition = decodePosition(get<string>(CONTROL_POSITION_KEY, ''))
@@ -415,19 +387,7 @@
     private playerHeight = 0
     private safeAreaProbe: HTMLElement | null = null
     private safeArea: SafeArea = { top: 0, bottom: 0, left: 0, right: 0 }
-    private touchBeganAt = 0
-    private lastTap: { p: Point; at: number } | null = null
-    private pendingTap: { p: Point; here: Point; at: number } | null = null
-    private pendingTapTimer = 0
-    private lateTap: { p: Point; at: number } | null = null
-    // the overlay is focused with inputmode="none" while a tap waits for the cursor
-    private focusHeld = false
     private scrollRemainder = { x: 0, y: 0 }
-    private composing = false
-    private composed = ''
-    private lastCompositionEnd = { data: '', at: 0 }
-    private lastKeydownAt = 0
-    private shiftWrapped = new Set<number>()
 
     get admin() {
       return this.$accessor.user.admin
@@ -568,13 +528,22 @@
     // ?tapKeyboard=auto (default) raises the keyboard when a tap lands on text,
     // chip offers a "tap to type" button there instead, always raises it on
     // every tap, off leaves it to the keyboard button
-    get tapKeyboard(): TapKeyboardMode {
+    get tapKeyboardMode(): TapKeyboardMode {
       const value = new URL(location.href).searchParams.get('tapKeyboard')
       return value === 'chip' || value === 'always' || value === 'off' ? value : 'auto'
     }
 
-    get focusNeedsGesture() {
-      return focusNeedsGesture(navigator)
+    get inputEnabled() {
+      return this.hosting && !this.locked
+    }
+
+    // Losing input ends the page's part of a touch instead of each handler
+    // checking for it.
+    @Watch('inputEnabled')
+    onInputEnabledChanged(enabled: boolean) {
+      if (enabled || !this.gestures) return
+      this.gestures.cancel()
+      this.tapKeyboard.cancel()
     }
 
     @Watch('width')
@@ -685,7 +654,29 @@
         onPinchMove: this.onGesturePinchMove,
         onPinchEnd: this.onGesturePinchEnd,
       })
-      this.$client.on('cursor', this.onCursorImage)
+      this.tapKeyboard = new TapKeyboard(
+        this.tapKeyboardMode,
+        focusNeedsGesture(navigator),
+        {
+          keyboardOpen: () => this.keyboardOpen,
+          focus: this.focusForTyping,
+          hold: this.holdFocus,
+          release: () => this._overlay.blur(),
+          showChip: this.showTypeChip,
+        },
+        {
+          now: () => performance.now(),
+          setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+          clearTimeout: (id) => window.clearTimeout(id),
+        },
+      )
+      this.textInput = new TextInput(
+        (event, key) => this.$client.sendData(event, { key }),
+        () => !!this.keyboard.modifiers.shift,
+        () => this.is_touch_device,
+      )
+      // only touch input reads the cursor shape
+      if (this.is_touch_device) this.$client.on('cursor', this.onCursorImage)
 
       this._container.addEventListener('resize', this.onResize)
       this.onVolumeChanged(this.volume)
@@ -768,13 +759,7 @@
           return true
         }
 
-        this.lastKeydownAt = performance.now()
-        if (this.is_touch_device && keysymNeedsShift(key) && !this.keyboard.modifiers.shift) {
-          this.shiftWrapped.add(key)
-          this.$client.sendData('keydown', { key: XK_SHIFT_L })
-        }
-
-        this.$client.sendData('keydown', { key: this.keyMap(key) })
+        this.textInput.keyDown(key, this.keyMap(key))
       }
       this.keyboard.onkeyup = (key: number) => {
         if (!this.hosting || this.locked) {
@@ -786,19 +771,16 @@
           return
         }
 
-        this.$client.sendData('keyup', { key: this.keyMap(key) })
-        if (this.shiftWrapped.delete(key)) {
-          this.$client.sendData('keyup', { key: XK_SHIFT_L })
-        }
+        this.textInput.keyUp(key, this.keyMap(key))
       }
       this.keyboard.listenTo(this._overlay)
     }
 
     beforeDestroy() {
       this.gestures.destroy()
+      this.tapKeyboard.cancel()
       this.$client.off('cursor', this.onCursorImage)
       window.clearTimeout(this.typeChipTimer)
-      window.clearTimeout(this.pendingTapTimer)
       if (this.safeAreaProbe) this.safeAreaProbe.remove()
       if (this._wheelHandler) {
         document.removeEventListener('wheel', this._wheelHandler, { capture: true })
@@ -1027,10 +1009,6 @@
       this.gestures.touchCancel()
     }
 
-    canSendInput() {
-      return this.hosting && !this.locked
-    }
-
     // maps a client point on the (possibly zoomed) video to remote screen pixels
     remotePoint(p: Point) {
       const { w, h } = this.$accessor.video.resolution
@@ -1041,24 +1019,13 @@
       }
     }
 
-    sendPointer(p: Point) {
-      const next = this.remotePoint(p)
-      if (!this.pointer || !nearSpot(next, this.pointer)) {
-        this.previousPointerJumpAt = this.pointerJumpAt
-        this.pointerJumpAt = performance.now()
-      }
-      this.pointer = next
-      this.$client.sendData('mousemove', next)
+    // remote pixels per client pixel at the current zoom
+    remotePerClient() {
+      return this.width / this._overlay.getBoundingClientRect().width
     }
 
-    // The remote pointer position a new cursor image belongs to, or null when
-    // an update for an earlier position could still be in flight.
-    cursorImageOwner() {
-      return this.pointerJumpAt - this.previousPointerJumpAt >= CURSOR_WAIT_MS ? this.pointer : null
-    }
-
-    clickAt(p: Point, button: number) {
-      this.sendPointer(p)
+    clickAt(here: Point, button: number) {
+      this.$client.sendData('mousemove', here)
       this.$client.sendData('mousedown', { key: button })
       this.$client.sendData('mouseup', { key: button })
     }
@@ -1066,9 +1033,8 @@
     onGestureBegin(p: Point) {
       this.unmuteOnInteraction()
       this.hideTypeChip()
-      this.cancelPendingTap()
+      this.tapKeyboard.touchBegin()
       if (this._controls) this._controls.wake()
-      this.touchBeganAt = performance.now()
 
       if (!this.controlling && this.implicitHosting && !this.locked) {
         this.$accessor.remote.request()
@@ -1076,70 +1042,46 @@
       if (!this.hosting) {
         this.$emit('control-attempt')
       }
-      if (this.canSendInput()) {
-        this.sendPointer(p)
-      }
+      // without input the touch stays local, where only a pinch zooms
+      if (!this.inputEnabled) return false
+      this.$client.sendData('mousemove', this.remotePoint(p))
+      return true
     }
 
     onGestureTap(p: Point) {
-      const now = performance.now()
-      const last = this.lastTap
-      this.lastTap = { p, at: now }
-
-      if (
-        this.zoomed &&
-        last &&
-        now - last.at < DOUBLE_TAP_MS &&
-        Math.hypot(p.x - last.p.x, p.y - last.p.y) < DOUBLE_TAP_SLOP
-      ) {
-        this.lastTap = null
-        this.resetZoom()
-        return
-      }
-
-      if (!this.canSendInput()) return
-      this.clickAt(p, 1)
-      this.keyboardAfterTap(p)
+      const here = this.remotePoint(p)
+      this.clickAt(here, 1)
+      this.tapKeyboard.tap(p, here, this.remotePerClient())
     }
 
     onGestureLongPress() {
-      if (!this.canSendInput()) return
       if (navigator.vibrate) navigator.vibrate(15)
     }
 
     onGestureLongPressRelease(p: Point) {
-      if (!this.canSendInput()) return
-      this.clickAt(p, 3)
+      this.clickAt(this.remotePoint(p), 3)
     }
 
     onGestureDragStart(p: Point) {
-      if (!this.canSendInput()) return
-      this.sendPointer(p)
+      this.$client.sendData('mousemove', this.remotePoint(p))
       this.pressedMouseButtons.add(1)
       this.$client.sendData('mousedown', { key: 1 })
     }
 
     onGestureDragMove(p: Point) {
-      if (!this.canSendInput()) return
-      this.sendPointer(p)
+      this.$client.sendData('mousemove', this.remotePoint(p))
     }
 
     onGestureDragEnd(p: Point) {
       if (!this.pressedMouseButtons.has(1)) return
-      this.sendPointer(p)
+      this.$client.sendData('mousemove', this.remotePoint(p))
       this.pressedMouseButtons.delete(1)
       this.$client.sendData('mouseup', { key: 1 })
     }
 
     onGestureScroll(dx: number, dy: number) {
-      if (!this.canSendInput()) {
-        this.gestures.stopFling()
-        return
-      }
-
       // finger travel in remote pixels; content follows the finger, so scroll the opposite way
-      const remotePerClient = this.width / this._overlay.getBoundingClientRect().width
-      const units = TOUCH_SCROLL_UNITS_PER_PX * remotePerClient
+      const units = TOUCH_SCROLL_UNITS_PER_PX * this.remotePerClient()
       this.scrollRemainder.x -= dx * units
       this.scrollRemainder.y -= dy * units
 
@@ -1156,6 +1098,7 @@
 
     onGesturePinchStart(mid: Point, distance: number) {
       this.hideTypeChip()
+      this.tapKeyboard.touchBegin()
       this.zoom.pinchStart(mid, distance)
     }
 
@@ -1180,10 +1123,13 @@
     }
 
     // the area the zoomed video may fill: the player minus the control band
+    // and the part an overlaid soft keyboard covers
     playerBox(): Box {
-      const { left, top, width, height } = this._player.getBoundingClientRect()
+      const player = this._player.getBoundingClientRect()
+      const { left, top, width } = player
+      const height = player.height - this.keyboardInset
       const { mode, band } = this.touchLayout
-      if (mode === 'bottom') return { left, top, width, height: height - band }
+      if (mode === 'bottom') return { left, top, width, height: player.height - Math.max(band, this.keyboardInset) }
       if (mode === 'left') return { left: left + band, top, width: width - band, height }
       if (mode === 'right') return { left, top, width: width - band, height }
       return { left, top, width, height }
@@ -1206,111 +1152,11 @@
       this.applyZoom(true)
     }
 
-    // Runs inside touchend. The remote cursor shape is the signal: Chromium
-    // shows an I-beam over text fields (and over selectable page text, which is
-    // the false positive), and the pointer was moved to the tap position on
-    // touchstart. A text cursor that showed up during this touch, or was seen at
-    // this spot before, raises the keyboard here. Otherwise the cursor update
-    // decides, and over a real network it usually arrives after the finger
-    // lifts. iOS ignores focus() outside a gesture, so there the overlay is
-    // focused now with inputmode="none", which shows no keyboard, and removing
-    // inputmode later raises it.
-    keyboardAfterTap(p: Point) {
-      this.cancelPendingTap()
-
-      if (this.tapKeyboard === 'off') return
-      if (this.tapKeyboard === 'always') {
-        this.focusForTyping()
-        return
-      }
-
-      const here = this.remotePoint(p)
-      if (this.cursorKind === 'text' && this.cursorChangedAt >= this.touchBeganAt) {
-        this.offerKeyboard(p, true)
-        return
-      }
-      if (this.nearTextSpot(here)) {
-        this.offerKeyboard(p, true)
-        // the tap may still have moved the pointer off the field, which the
-        // end of the window catches
-        if (this.tapKeyboard !== 'auto') return
-      } else if (this.tapKeyboard === 'auto' && !this.keyboardOpen && this.focusNeedsGesture) {
-        this.holdFocus()
-      }
-
-      // Pages often flash another cursor before the I-beam, so any text cursor
-      // within the window counts; only the end of the window means "not text".
-      this.pendingTap = { p, here, at: performance.now() }
-      this.pendingTapTimer = window.setTimeout(this.endPendingTap, CURSOR_WAIT_MS)
-    }
-
-    // A new touch ends the wait for the previous tap's cursor, so it cannot
-    // raise the keyboard during a scroll, pinch or drag.
-    cancelPendingTap() {
-      window.clearTimeout(this.pendingTapTimer)
-      this.pendingTap = null
-      this.lateTap = null
-      if (this.focusHeld) this._overlay.blur()
-    }
-
-    // whether a tap lands where a text cursor was seen, measured on screen
-    nearTextSpot(here: Point) {
-      if (!this.textSpot) return false
-      const remotePerClient = this.$accessor.video.resolution.w / this._overlay.getBoundingClientRect().width
-      const radius = Math.max(CURSOR_SAME_SPOT, TEXT_SPOT_RADIUS * remotePerClient)
-      return Math.hypot(here.x - this.textSpot.x, here.y - this.textSpot.y) <= radius
-    }
-
-    offerKeyboard(p: Point, inGesture: boolean) {
-      if (this.keyboardOpen) return
-      if (this.tapKeyboard === 'auto' && (inGesture || this.focusHeld || !this.focusNeedsGesture)) {
-        this.focusForTyping()
-      } else {
-        this.showTypeChip(p)
-      }
-    }
-
-    // No new text cursor showed up for the tap. An I-beam that was already
-    // showing stays put when the tap lands on text again, so only a non-text
-    // cursor means the tap was not on a text field.
-    endPendingTap() {
-      const tap = this.pendingTap
-      if (!tap) return
-      this.pendingTap = null
-      if (this.cursorKind === 'text') {
-        if (this.pointer && nearSpot(this.pointer, tap.here)) this.textSpot = tap.here
-        this.offerKeyboard(tap.p, false)
-        return
-      }
-      if (this.nearTextSpot(tap.here)) this.textSpot = null
-      if (this.tapKeyboard === 'auto') this.lateTap = tap
-      if (this.keyboardOpen || this.focusHeld) this._overlay.blur()
-    }
-
     onCursorImage(image: CursorImage) {
       // classification is async; only the newest cursor image may apply
       const seq = ++this.cursorSeq
-      const at = this.cursorImageOwner()
       const apply = (kind: CursorKind) => {
-        if (seq !== this.cursorSeq) return
-        this.cursorKind = kind
-        this.cursorChangedAt = performance.now()
-        if (kind !== 'text') return
-
-        if (at) this.textSpot = at
-        const tap = this.pendingTap
-        if (tap && performance.now() - tap.at < CURSOR_WAIT_MS) {
-          window.clearTimeout(this.pendingTapTimer)
-          this.pendingTap = null
-          this.offerKeyboard(tap.p, false)
-          return
-        }
-        // too late to raise the keyboard, so offer it at the tap
-        const late = this.lateTap
-        if (late && performance.now() - late.at < CURSOR_LATE_MS) {
-          this.lateTap = null
-          if (!this.keyboardOpen) this.showTypeChip(late.p)
-        }
+        if (seq === this.cursorSeq) this.tapKeyboard.cursor(kind)
       }
 
       const cached = cachedCursorKind(image)
@@ -1344,11 +1190,11 @@
     focusForTyping() {
       this.resetInputSentinel()
       this._overlay.removeAttribute('inputmode')
-      if (this.focusHeld) {
-        this.focusHeld = false
-        this.onOverlayFocus()
-      } else {
+      if (document.activeElement !== this._overlay) {
         this._overlay.focus({ preventScroll: true })
+      } else if (!this.keyboardOpen) {
+        // removing inputmode from a held focus raised the keyboard
+        this.onOverlayFocus()
       }
     }
 
@@ -1358,12 +1204,10 @@
     // finger lifts can still open it.
     holdFocus() {
       this._overlay.setAttribute('inputmode', 'none')
-      this.focusHeld = true
       this._overlay.focus({ preventScroll: true })
-      if (document.activeElement !== this._overlay) {
-        this.focusHeld = false
-        this._overlay.removeAttribute('inputmode')
-      }
+      if (document.activeElement === this._overlay) return true
+      this._overlay.removeAttribute('inputmode')
+      return false
     }
 
     // iOS overlays the soft keyboard on the layout viewport instead of resizing
@@ -1393,74 +1237,24 @@
     // input events, which the Guacamole keyboard does not handle.
     onOverlayInput(e: Event) {
       if (!this.is_touch_device) return
-      const event = e as InputEvent
-
-      if (!this.canSendInput()) {
-        if (!this.composing) this.resetInputSentinel()
-        return
+      if (this.inputEnabled) {
+        const { inputType, data } = e as InputEvent
+        this.textInput.input(inputType, data)
       }
+      if (!this.textInput.composing) this.resetInputSentinel()
+    }
 
-      if (event.inputType === 'insertCompositionText') {
-        this.updateComposition(event.data || '')
-        return
-      }
-
-      // the Guacamole keyboard already sent this key
-      const handledByKeydown = performance.now() - this.lastKeydownAt < 50
-      const echoOfComposition =
-        event.data === this.lastCompositionEnd.data && performance.now() - this.lastCompositionEnd.at < 50
-
-      if (!handledByKeydown && !echoOfComposition) {
-        switch (event.inputType) {
-          case 'insertText':
-          case 'insertReplacementText':
-            this.typeText(event.data || '')
-            break
-          case 'insertLineBreak':
-          case 'insertParagraph':
-            this.pressKey(XK_RETURN)
-            break
-          case 'deleteContentBackward':
-            this.pressKey(XK_BACKSPACE)
-            break
-        }
-      }
-
-      if (!this.composing) this.resetInputSentinel()
+    onOverlayKey(e: KeyboardEvent) {
+      this.textInput.keyEvent(e.getModifierState('CapsLock'))
     }
 
     onCompositionStart() {
-      this.composing = true
-      this.composed = ''
+      this.textInput.compositionStart()
     }
 
     onCompositionEnd(e: CompositionEvent) {
-      if (this.canSendInput()) this.updateComposition(e.data || '')
-      this.lastCompositionEnd = { data: e.data || '', at: performance.now() }
-      this.composing = false
-      this.composed = ''
+      this.textInput.compositionEnd(e.data || '', this.inputEnabled)
       this.resetInputSentinel()
-    }
-
-    updateComposition(text: string) {
-      const { deletes, insert } = textDiff(this.composed, text)
-      for (let i = 0; i < deletes; i++) this.pressKey(XK_BACKSPACE)
-      this.typeText(insert)
-      this.composed = text
-    }
-
-    typeText(text: string) {
-      for (const ch of Array.from(text)) {
-        const shift = needsShift(ch) && !this.keyboard.modifiers.shift
-        if (shift) this.$client.sendData('keydown', { key: XK_SHIFT_L })
-        this.pressKey(charToKeysym(ch))
-        if (shift) this.$client.sendData('keyup', { key: XK_SHIFT_L })
-      }
-    }
-
-    pressKey(key: number) {
-      this.$client.sendData('keydown', { key })
-      this.$client.sendData('keyup', { key })
     }
 
     focusOverlay() {
@@ -1608,7 +1402,7 @@
     }
 
     onOverlayFocus() {
-      if (this.focusHeld) return
+      if (this.tapKeyboard.holding) return
       this.keyboardOpen = true
       if (this.hosting) {
         this.syncClipboard()
@@ -1616,7 +1410,7 @@
     }
 
     onOverlayBlur() {
-      this.focusHeld = false
+      this.tapKeyboard.blur()
       this._overlay.removeAttribute('inputmode')
       this.keyboardOpen = false
       this.resetKeyboard()

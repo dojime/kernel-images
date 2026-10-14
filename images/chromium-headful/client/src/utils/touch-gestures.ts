@@ -8,8 +8,10 @@ export interface Point {
 }
 
 export interface GestureHandlers {
-  // first finger down; called before any other handler for the sequence
-  onTouchBegin(p: Point): void
+  // First finger down; called before any other handler for the sequence.
+  // Returns whether the touch belongs to the page. If not, only a pinch is
+  // recognized until every finger lifts.
+  onTouchBegin(p: Point): boolean
   // called synchronously from touchend, so it runs inside the user gesture
   onTap(p: Point): void
   onLongPress(p: Point): void
@@ -34,7 +36,8 @@ const FLING_DECAY = 0.9975
 const FLING_MIN_START = 0.15
 const FLING_MIN_STOP = 0.02
 
-type Mode = 'idle' | 'pending' | 'scroll' | 'held' | 'drag' | 'pinch'
+// passive: the touch does not belong to the page, so only a pinch is recognized
+type Mode = 'idle' | 'pending' | 'passive' | 'scroll' | 'held' | 'drag' | 'pinch'
 
 interface Sample extends Point {
   t: number
@@ -75,7 +78,10 @@ export class TouchGestures {
       this.last = p
       this.samples = [{ ...p, t: e.timeStamp }]
       this.mode = 'pending'
-      this.handlers.onTouchBegin(p)
+      if (!this.handlers.onTouchBegin(p)) {
+        this.mode = 'passive'
+        return
+      }
       this.longPressTimer = setTimeout(() => {
         this.longPressTimer = undefined
         if (this.mode === 'pending') {
@@ -107,7 +113,7 @@ export class TouchGestures {
       return
     }
 
-    if (e.touches.length !== 1) return
+    if (e.touches.length !== 1 || this.mode === 'passive') return
     const p = point(e.touches[0])
 
     switch (this.mode) {
@@ -172,6 +178,14 @@ export class TouchGestures {
     this.mode = 'idle'
   }
 
+  // Ends the page's part of the current gesture, including a fling, without
+  // calling any more handlers for it. A pinch carries on.
+  cancel() {
+    this.clearLongPress()
+    this.stopFling()
+    if (this.mode !== 'idle' && this.mode !== 'pinch') this.mode = 'passive'
+  }
+
   // returns true if a fling was running
   stopFling() {
     if (this.flingFrame === undefined) return false
@@ -212,6 +226,8 @@ export class TouchGestures {
       vx *= decay
       vy *= decay
       this.handlers.onScroll(vx * elapsed, vy * elapsed, anchor)
+      // the handler may have stopped the fling
+      if (this.flingFrame === undefined) return
       if (Math.hypot(vx, vy) < FLING_MIN_STOP) {
         this.flingFrame = undefined
         return

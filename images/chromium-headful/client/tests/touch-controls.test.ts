@@ -1,4 +1,8 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { runInNewContext } from 'node:vm'
+import ts from 'typescript'
+import { parseComponent } from 'vue-template-compiler'
 import {
   BAND_SIZE,
   ControlFrame,
@@ -78,5 +82,64 @@ describe('placing and dragging the control', () => {
     expect(decodePosition(encodePosition(position))).toEqual(position)
     expect(decodePosition('')).toEqual(DEFAULT_POSITION)
     expect(decodePosition('up:abc:2000')).toEqual({ side: 'left', x: DEFAULT_POSITION.x, y: 1 })
+  })
+})
+
+describe('keyboard control', () => {
+  // the real component methods, without mounting it
+  const script = parseComponent(readFileSync(new URL('../src/components/touch-controls.vue', import.meta.url), 'utf8'))
+    .script!.content
+  const compiled = ts.transpileModule(script, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, experimentalDecorators: true },
+  }).outputText
+  const exports: { default?: { prototype: Record<string, Function> } } = {}
+  const noDecorator = () => () => undefined
+  runInNewContext(compiled, {
+    exports,
+    require: (name: string) =>
+      name === 'vue-property-decorator'
+        ? {
+            Vue: class {},
+            Component: () => (type: unknown) => type,
+            Ref: noDecorator,
+            Watch: noDecorator,
+            Prop: noDecorator,
+          }
+        : {},
+  })
+  const methods = exports.default!.prototype
+
+  const control = (mode: string) => {
+    const emitted: string[] = []
+    const ctx: Record<string, any> = {
+      mode,
+      faded: true,
+      dragPoint: null,
+      corner: { x: 0, y: 0 },
+      localPoint: () => ({ x: 20, y: 20 }),
+      wake: () => (ctx.faded = false),
+      $emit: (name: string) => emitted.push(name),
+    }
+    ctx.toggle = () => methods.toggle.call(ctx)
+    const tap = () => {
+      methods.onTouchStart.call(ctx, { changedTouches: [{}] })
+      methods.onTouchEnd.call(ctx)
+    }
+    return { ctx, emitted, tap }
+  }
+
+  test('the first tap on a faded control over the stream only wakes it', () => {
+    const { ctx, emitted, tap } = control('overlay')
+    tap()
+    expect(ctx.faded).toBe(false)
+    expect(emitted).toEqual([])
+    tap()
+    expect(emitted).toEqual(['toggle'])
+  })
+
+  test('a faded control in a band toggles on the first tap', () => {
+    const { emitted, tap } = control('bottom')
+    tap()
+    expect(emitted).toEqual(['toggle'])
   })
 })
