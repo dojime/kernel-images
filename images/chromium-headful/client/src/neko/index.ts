@@ -132,11 +132,8 @@ export class NekoClient extends BaseClient implements EventEmitter<NekoEvents> {
     this.$accessor.video.setStream(0)
   }
 
-  protected [EVENT.DATA](data: ArrayBuffer | Blob) {
-    if (data instanceof Blob) {
-      data.arrayBuffer().then((buffer) => this[EVENT.DATA](buffer))
-      return
-    }
+  protected [EVENT.DATA](data: ArrayBuffer | string) {
+    if (!(data instanceof ArrayBuffer)) return
 
     const image = parseCursorImage(data)
     if (image) {

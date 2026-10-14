@@ -226,6 +226,48 @@ describe('tap keyboard on iOS', () => {
     expect(t.events).toEqual(['hold', 'release'])
   })
 
+  test("the previous tap's I-beam arriving during the next tap does not raise the keyboard", () => {
+    const t = setup('auto')
+    t.tap(field)
+    t.advance(20)
+    // the next tap lands on a blank spot before the field's I-beam arrives
+    t.tap(blank)
+    t.advance(30)
+    t.keyboard.cursor('text')
+    expect(t.overlay()).not.toBe('open')
+    t.advance(50)
+    t.keyboard.cursor('other')
+    t.advance(800)
+    expect(t.events).toEqual(['hold', 'release', 'hold', 'release'])
+  })
+
+  test('an I-beam that may be stale and is never replaced offers the chip', () => {
+    const t = setup('auto')
+    t.tap(field)
+    t.advance(20)
+    t.tap({ x: field.x, y: field.y + 40 })
+    t.advance(30)
+    t.keyboard.cursor('text')
+    t.advance(800)
+    expect(t.events).toEqual(['hold', 'release', 'hold', 'release', 'chip'])
+  })
+
+  test('a tap after the previous cursor settled is not affected', () => {
+    const t = setup('auto')
+    t.tap(field)
+    t.advance(150)
+    t.keyboard.cursor('text')
+    t.dismiss()
+    t.events.length = 0
+    t.advance(2000)
+    t.tap({ x: field.x + 100, y: field.y + 60 })
+    t.advance(100)
+    t.keyboard.cursor('other')
+    t.advance(100)
+    t.keyboard.cursor('text')
+    expect(t.events).toEqual(['hold', 'raise-held'])
+  })
+
   test('a held focus lost to the OS falls back to the chip', () => {
     const t = setup('auto')
     t.tap(field)

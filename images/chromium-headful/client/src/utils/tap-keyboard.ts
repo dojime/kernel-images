@@ -57,6 +57,11 @@ export class TapKeyboard {
   private cursorKind: CursorKind = 'unknown'
   private cursorChangedAt = -Infinity
   private touchBeganAt = 0
+  // A text cursor before this time may be for the previous tap's position, whose
+  // update can still be in flight when the pointer moves on, and the latest
+  // text cursor arrived in that window.
+  private staleUntil = -Infinity
+  private cursorStale = false
   // remote position where a text cursor was last seen after a tap
   private textSpot: Point | null = null
 
@@ -76,6 +81,7 @@ export class TapKeyboard {
   // raise the keyboard during a scroll, pinch or drag.
   touchBegin() {
     this.touchBeganAt = this.clock.now()
+    if (this.state.name !== 'idle') this.staleUntil = this.touchBeganAt + CURSOR_WAIT_MS
     this.cancel()
   }
 
@@ -89,7 +95,7 @@ export class TapKeyboard {
     }
 
     const tap = { p, here, scale, at: this.clock.now() }
-    if (this.cursorKind === 'text' && this.cursorChangedAt >= this.touchBeganAt) {
+    if (this.cursorKind === 'text' && this.cursorChangedAt >= this.touchBeganAt && !this.cursorStale) {
       this.textSpot = here
       this.offer(tap, true)
       return
@@ -116,10 +122,13 @@ export class TapKeyboard {
   cursor(kind: CursorKind) {
     this.cursorKind = kind
     this.cursorChangedAt = this.clock.now()
+    this.cursorStale = kind === 'text' && this.cursorChangedAt < this.staleUntil
     if (kind !== 'text') return
 
     const state = this.state
-    if (state.name === 'waiting') {
+    // a possibly stale I-beam is left to the end of the window, when a later
+    // cursor may have replaced it
+    if (state.name === 'waiting' && !this.cursorStale) {
       this.clock.clearTimeout(state.timer)
       this.state = { name: 'idle' }
       this.textSpot = state.tap.here
@@ -154,6 +163,12 @@ export class TapKeyboard {
     const state = this.state
     if (state.name !== 'waiting') return
     this.state = { name: 'idle' }
+    if (this.cursorKind === 'text' && this.cursorStale) {
+      // no later cursor settled it, so ask instead of guessing
+      if (state.heldFocus) this.out.release()
+      if (!this.out.keyboardOpen()) this.out.showChip(state.tap.p)
+      return
+    }
     if (this.cursorKind === 'text') {
       this.textSpot = state.tap.here
       this.offer(state.tap, state.heldFocus)

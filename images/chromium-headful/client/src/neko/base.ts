@@ -352,6 +352,8 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
     }
 
     this._channel = this._peer.createDataChannel('data')
+    // Safari defaults to blob, whose async conversion can reorder messages
+    this._channel.binaryType = 'arraybuffer'
     this._channel.onerror = this.onError.bind(this)
     this._channel.onmessage = this.onData.bind(this)
     this._channel.onclose = this.onDisconnected.bind(this, new Error('peer data channel closed'))
