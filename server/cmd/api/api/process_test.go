@@ -66,7 +66,7 @@ func TestProcessSpawnStatusAndStream(t *testing.T) {
 	// Start stream reader and collect at least two data events and one exit event
 	streamResp, err := svc.ProcessStdoutStream(ctx, oapi.ProcessStdoutStreamRequestObject{ProcessId: *s200.ProcessId})
 	require.NoError(t, err, "StdoutStream error")
-	st200, ok := streamResp.(oapi.ProcessStdoutStream200TexteventStreamResponse)
+	st200, ok := streamResp.(processStreamResponse)
 	require.True(t, ok, "unexpected stream resp: %T", streamResp)
 
 	reader := bufio.NewReader(st200.Body)
