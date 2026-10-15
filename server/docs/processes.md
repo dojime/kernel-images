@@ -20,7 +20,9 @@ Spawned process status and output remain available for 10 seconds after capture 
 
 ## Streaming and reconnecting
 
-`GET /process/{process_id}/stdout/stream` replays captured output from the beginning, then follows new output. Each connection reads independently. Data events include an opaque `offset`, also emitted as the SSE `id`. To resume after a data event, send its cursor as `?offset=...` or the `Last-Event-ID` header. The query parameter takes precedence. Invalid cursors return 400; expired processes return 404.
+`GET /process/{process_id}/stdout/stream` without a cursor consumes the process's unread output, including output captured before the first connection. Reconnects continue at the shared consumed position and do not repeat a consumed exit event. Concurrent cursorless connections divide the output, as with the original queue. Consumption happens when a record is read for delivery; a disconnect can lose an in-flight record, so use explicit cursors when delivery must be resumable.
+
+Supplying `?offset=0` replays all retained output, then follows new output. Data events include an opaque `offset`, also emitted as the SSE `id`. To resume after a data event, send its cursor as `?offset=...` or the `Last-Event-ID` header. These explicit cursors read independently and do not advance cursorless consumption. The query parameter takes precedence. Invalid cursors return 400; expired processes return 404.
 
 An `exit` event follows all captured output and includes `exit_code`, `output_truncated`, and, when execution was stopped by the server, `termination_reason`. Clients must check the terminal event to distinguish complete capture from partial output. Reconnection does not extend retention.
 
@@ -29,6 +31,8 @@ An `exit` event follows all captured output and includes `exit_code`, `output_tr
 A timeout or exec request cancellation sends SIGKILL to the command's process group. Ordinary child processes in that group are included. A descendant that deliberately creates its own session or process group can survive. After the direct child exits, capture drains for at most one additional second; pipes still held open at that point are closed, remaining processes in the original group are killed, and the result is marked `output_truncated`.
 
 An exec timeout returns HTTP 422 with `code: process_timeout`, `message`, `exit_code`, `duration_ms`, and partial `stdout_b64` / `stderr_b64`. Output quota, capture failure, and cancellation also use 422, with `output_limit`, `output_error`, or `process_canceled`. These execution failures must not be retried automatically because the command may already have performed side effects. An ordinary nonzero command exit remains HTTP 200 with its exit code.
+
+Manual `/kill` requests continue to signal only the requested process, using the specified signal.
 
 Spawn keeps running after its HTTP request ends, but still honors its execution timeout and server shutdown. Status and the stream's exit event report why it stopped.
 

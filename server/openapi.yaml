@@ -103,10 +103,12 @@ paths:
     get:
       summary: Stream retained process stdout and stderr over SSE
       description: |
-        Output is retained until 10 seconds after completion. Each connection replays
-        from the beginning unless an offset or Last-Event-ID from a previous data
-        event is supplied. Exit is sent after all retained output. Active streams
-        also end when retention expires. PTY output is available through attach.
+        Output is retained until 10 seconds after completion. Without a cursor,
+        connections share consumption: reconnects continue unread output and do not
+        repeat a consumed exit event. Supply offset=0 to replay from the beginning,
+        or an offset or Last-Event-ID from a previous data event to resume independently.
+        Exit follows the retained output. Active streams also end when retention
+        expires. PTY output is available through attach.
       operationId: processStdoutStream
       x-telemetry-category: platform
       parameters:
@@ -118,7 +120,7 @@ paths:
             format: uuid
         - name: offset
           in: query
-          description: Resume cursor from a prior output event. Overrides Last-Event-ID.
+          description: Resume cursor from a prior output event, or 0 to replay all retained output. Overrides Last-Event-ID.
           schema:
             type: integer
             format: int64

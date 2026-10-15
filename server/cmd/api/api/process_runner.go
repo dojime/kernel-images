@@ -26,9 +26,13 @@ func (s *ApiService) startProcess(ctx context.Context, cmd *exec.Cmd, tty, stdin
 	}
 	budget := s.processOutput
 	s.procMu.Unlock()
-	output, err := budget.open()
-	if err != nil {
-		return nil, fmt.Errorf("create process output: %v", err)
+	output := &processOutput{changed: make(chan struct{}), closed: make(chan struct{})}
+	var err error
+	if !tty {
+		output, err = budget.open()
+		if err != nil {
+			return nil, fmt.Errorf("create process output: %v", err)
+		}
 	}
 	h := &processHandle{id: uuid.New(), cmd: cmd, started: time.Now(), isTTY: tty, output: output, doneCh: make(chan struct{})}
 	if tty {
@@ -194,30 +198,24 @@ func (h *processHandle) run(ctx, lifecycle context.Context, timeoutSec *int, rel
 			drain = nil
 		}
 	}
-	// Reap while holding the same lock used by signal requests, so no signal can
-	// target a reused PID between Wait and publishing the exit code.
-	h.mu.Lock()
-	reapProcess(h.cmd)
-	code := h.cmd.ProcessState.ExitCode()
-	h.exitCode = &code
-	h.mu.Unlock()
+	close(failures)
+	for err := range failures {
+		h.outputFailed(err)
+	}
 	h.closeOutputPipes()
 	if h.stdin != nil {
 		h.stdin.Close()
 	}
-	for {
-		select {
-		case err := <-failures:
-			h.outputFailed(err)
-		default:
-			h.mu.Lock()
-			h.durationMs = int(time.Since(h.started) / time.Millisecond)
-			h.mu.Unlock()
-			h.output.finish()
-			close(h.doneCh)
-			return
-		}
-	}
+	// Reap while holding the same lock used by signal requests, so no signal can
+	// target a reused PID between Wait and publishing the final status.
+	h.mu.Lock()
+	reapProcess(h.cmd)
+	code := h.cmd.ProcessState.ExitCode()
+	h.durationMs = int(time.Since(h.started) / time.Millisecond)
+	h.exitCode = &code
+	h.mu.Unlock()
+	h.output.finish()
+	close(h.doneCh)
 }
 
 func (h *processHandle) captureOutput(stream byte, pipe io.Reader) error {

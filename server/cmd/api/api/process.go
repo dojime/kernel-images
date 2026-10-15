@@ -227,8 +227,11 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 	}
 	tty := body.AllocateTty != nil && *body.AllocateTty
 	if tty {
-		if (body.Rows != nil && (*body.Rows < 1 || *body.Rows > 65535)) || (body.Cols != nil && (*body.Cols < 1 || *body.Cols > 65535)) {
-			return oapi.ProcessSpawn400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: "rows and cols must be between 1 and 65535"}}, nil
+		if body.Rows != nil && *body.Rows > 65535 {
+			return oapi.ProcessSpawn400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: "rows must be <= 65535"}}, nil
+		}
+		if body.Cols != nil && *body.Cols > 65535 {
+			return oapi.ProcessSpawn400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: "cols must be <= 65535"}}, nil
 		}
 		hasTerm := false
 		for _, env := range cmd.Env {
@@ -249,7 +252,7 @@ func (s *ApiService) ProcessSpawn(ctx context.Context, request oapi.ProcessSpawn
 		logger.FromContext(ctx).Error("failed to start process", "err", err)
 		return oapi.ProcessSpawn500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: "failed to start process"}}, nil
 	}
-	if tty && body.Rows != nil && body.Cols != nil {
+	if tty && body.Rows != nil && *body.Rows > 0 && body.Cols != nil && *body.Cols > 0 {
 		_ = pty.Setsize(h.ptyFile, &pty.Winsize{Rows: uint16(*body.Rows), Cols: uint16(*body.Cols)})
 	}
 	go s.retainProcess(h)
@@ -289,7 +292,7 @@ func (s *ApiService) ProcessKill(ctx context.Context, request oapi.ProcessKillRe
 	if h.exitCode != nil {
 		return oapi.ProcessKill404JSONResponse{NotFoundErrorJSONResponse: oapi.NotFoundErrorJSONResponse{Message: "process not running"}}, nil
 	}
-	if err := signalChildProcessGroup(h.cmd, sig); err != nil {
+	if err := h.cmd.Process.Signal(sig); err != nil {
 		log.Error("failed to signal process", "err", err)
 		return oapi.ProcessKill500JSONResponse{InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{Message: "failed to signal process"}}, nil
 	}
@@ -390,76 +393,17 @@ func (s *ApiService) ProcessStdoutStream(ctx context.Context, request oapi.Proce
 	if err != nil || h.output.validateOffset(offset) != nil {
 		return oapi.ProcessStdoutStream400JSONResponse{BadRequestErrorJSONResponse: oapi.BadRequestErrorJSONResponse{Message: "invalid output offset"}}, nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	pr, pw := io.Pipe()
-	finished := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			pw.CloseWithError(ctx.Err())
-		case <-h.output.closed:
-			pw.CloseWithError(os.ErrClosed)
-		case <-finished:
-		}
-	}()
-	go func() {
-		defer close(finished)
-		defer cancel()
-		defer pw.Close()
-		writeEvent := func(event oapi.ProcessStreamEvent) error {
-			data, err := json.Marshal(event)
-			if err != nil {
-				return err
-			}
-			if event.Offset != nil {
-				if _, err := fmt.Fprintf(pw, "id: %d\n", *event.Offset); err != nil {
-					return err
-				}
-			}
-			_, err = fmt.Fprintf(pw, "data: %s\n\n", data)
-			return err
-		}
-		for {
-			stream, data, next, err := h.output.next(ctx, offset)
-			if errors.Is(err, io.EOF) {
-				<-h.doneCh
-				h.mu.RLock()
-				code, reason, truncated := *h.exitCode, h.reason, h.truncated
-				h.mu.RUnlock()
-				event := oapi.ProcessStreamEvent{Event: ptrOf(oapi.Exit), ExitCode: &code, OutputTruncated: &truncated}
-				if reason != "" {
-					event.TerminationReason = ptrOf(oapi.ProcessTerminationReason(reason))
-				}
-				_ = writeEvent(event)
-				return
-			}
-			if err != nil {
-				pw.CloseWithError(err)
-				return
-			}
-			source := oapi.ProcessStreamEventStream("stdout")
-			if stream == 1 {
-				source = "stderr"
-			}
-			event := oapi.ProcessStreamEvent{Stream: &source, DataB64: ptrOf(base64.StdEncoding.EncodeToString(data)), Offset: &next}
-			if writeEvent(event) != nil {
-				return
-			}
-			offset = next
-		}
-	}()
 	return processStreamResponse{
-		ProcessStdoutStream200TexteventStreamResponse: oapi.ProcessStdoutStream200TexteventStreamResponse{
-			Body:    &processStreamReader{PipeReader: pr, cancel: cancel},
-			Headers: oapi.ProcessStdoutStream200ResponseHeaders{XSSEContentType: "application/json"},
-		},
-		expired: h.output.closed,
+		ctx: ctx, process: h, offset: offset,
+		replay: request.Params.Offset != nil || request.Params.LastEventID != nil,
 	}, nil
 }
 
 type processStreamResponse struct {
-	oapi.ProcessStdoutStream200TexteventStreamResponse
-	expired <-chan struct{}
+	ctx     context.Context
+	process *processHandle
+	offset  int64
+	replay  bool
 }
 
 func (r processStreamResponse) VisitProcessStdoutStreamResponse(w http.ResponseWriter) error {
@@ -468,27 +412,82 @@ func (r processStreamResponse) VisitProcessStdoutStreamResponse(w http.ResponseW
 	go func() {
 		defer close(stopped)
 		select {
-		case <-r.expired:
-			// Closing the source does not interrupt a network write already in progress.
-			_ = controller.SetWriteDeadline(time.Now())
+		case <-r.process.output.closed:
+		case <-r.ctx.Done():
 		case <-finished:
+			return
 		}
+		// Interrupt a network write already in progress on expiry or disconnect.
+		_ = controller.SetWriteDeadline(time.Now())
 	}()
 	defer func() {
 		close(finished)
 		<-stopped
 	}()
-	return r.ProcessStdoutStream200TexteventStreamResponse.VisitProcessStdoutStreamResponse(w)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-SSE-Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := controller.Flush(); err != nil {
+		return err
+	}
+	for {
+		var stream byte
+		var data []byte
+		var next int64
+		var err error
+		if r.replay {
+			stream, data, next, err = r.process.output.next(r.ctx, r.offset)
+		} else {
+			stream, data, next, err = r.process.output.nextUnread(r.ctx)
+		}
+		if errors.Is(err, errProcessOutputConsumed) {
+			return nil
+		}
+		var event oapi.ProcessStreamEvent
+		if errors.Is(err, io.EOF) {
+			h := r.process
+			<-h.doneCh
+			h.mu.RLock()
+			code, reason, truncated := *h.exitCode, h.reason, h.truncated
+			h.mu.RUnlock()
+			event = oapi.ProcessStreamEvent{Event: ptrOf(oapi.Exit), ExitCode: &code, OutputTruncated: &truncated}
+			if reason != "" {
+				event.TerminationReason = ptrOf(oapi.ProcessTerminationReason(reason))
+			}
+		} else if err != nil {
+			return err
+		} else {
+			source := oapi.ProcessStreamEventStream("stdout")
+			if stream == 1 {
+				source = "stderr"
+			}
+			event = oapi.ProcessStreamEvent{Stream: &source, DataB64: ptrOf(base64.StdEncoding.EncodeToString(data)), Offset: &next}
+		}
+		if err := writeProcessEvent(w, event); err != nil {
+			return err
+		}
+		if err := controller.Flush(); err != nil {
+			return err
+		}
+		if event.Event != nil {
+			return nil
+		}
+		r.offset = next
+	}
 }
 
-type processStreamReader struct {
-	*io.PipeReader
-	cancel context.CancelFunc
-}
-
-func (r *processStreamReader) Close() error {
-	r.cancel()
-	return r.PipeReader.Close()
+func writeProcessEvent(w io.Writer, event oapi.ProcessStreamEvent) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if event.Offset != nil {
+		if _, err := fmt.Fprintf(w, "id: %d\n", *event.Offset); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
 }
 
 func ptrOf[T any](v T) *T { return &v }

@@ -16,6 +16,7 @@ const (
 )
 
 var errProcessOutputLimit = errors.New("process output limit exceeded")
+var errProcessOutputConsumed = errors.New("process output already consumed")
 var errProcessOutputOffset = errors.New("invalid process output offset")
 
 // ProcessOutputConfig bounds stored output, including record headers. Zero limits
@@ -60,16 +61,18 @@ func (b *processOutputBudget) release(n int64) {
 }
 
 type processOutput struct {
-	mu        sync.Mutex
-	file      *os.File
-	budget    *processOutputBudget
-	size      int64
-	allocated int64
-	complete  bool
-	err       error
-	changed   chan struct{}
-	closed    chan struct{}
-	closeOnce sync.Once
+	mu             sync.Mutex
+	file           *os.File
+	budget         *processOutputBudget
+	size           int64
+	allocated      int64
+	complete       bool
+	err            error
+	changed        chan struct{}
+	closed         chan struct{}
+	closeOnce      sync.Once
+	consumedOffset int64
+	exitConsumed   bool
 }
 
 func (b *processOutputBudget) open() (*processOutput, error) {
@@ -136,8 +139,10 @@ func (o *processOutput) close() {
 		o.mu.Lock()
 		defer o.mu.Unlock()
 		close(o.closed)
-		o.file.Close()
-		o.budget.release(o.allocated)
+		if o.file != nil {
+			o.file.Close()
+			o.budget.release(o.allocated)
+		}
 	})
 }
 
@@ -197,5 +202,30 @@ func (o *processOutput) next(ctx context.Context, offset int64) (stream byte, da
 			return 0, nil, offset, os.ErrClosed
 		case <-changed:
 		}
+	}
+}
+
+// Cursorless streams share consumption, as with the original output queue.
+func (o *processOutput) nextUnread(ctx context.Context) (byte, []byte, int64, error) {
+	for {
+		o.mu.Lock()
+		offset, consumed := o.consumedOffset, o.exitConsumed
+		o.mu.Unlock()
+		if consumed {
+			return 0, nil, offset, errProcessOutputConsumed
+		}
+		stream, data, next, err := o.next(ctx, offset)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, nil, offset, err
+		}
+		o.mu.Lock()
+		if o.consumedOffset != offset || o.exitConsumed {
+			o.mu.Unlock()
+			continue
+		}
+		o.consumedOffset = next
+		o.exitConsumed = errors.Is(err, io.EOF)
+		o.mu.Unlock()
+		return stream, data, next, err
 	}
 }
