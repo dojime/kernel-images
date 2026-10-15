@@ -443,6 +443,15 @@ func TestBrowserReplExecutorsShutdownClosesTabOpenedAfterRetireBudget(t *testing
 	tabs.gate <- true
 	<-result
 	assert.Empty(t, tabs.open, "a tab that finishes opening after shutdown is closed")
+	assert.Eventually(t, func() bool {
+		entries, _ := os.ReadDir(filepath.Dir(browserReplSocketPath()))
+		for _, entry := range entries {
+			if entry.Name() != "browser-repl.sock" && filepath.Ext(entry.Name()) == ".sock" {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "the executor's process is stopped and its socket removed")
 }
 
 func TestHeapLimitWatcher(t *testing.T) {

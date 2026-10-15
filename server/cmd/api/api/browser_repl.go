@@ -926,8 +926,10 @@ func (m *browserReplManager) beginOperation(ctx context.Context, cancel context.
 		m.cancelCurrent = nil
 		m.infoMu.Unlock()
 		cancel(nil)
-		if m.restartPending.Swap(false) {
-			m.terminateLocked(context.WithoutCancel(ctx), "restart")
+		// A removed executor's retire may have stopped waiting for this
+		// operation, so the operation ends the child itself.
+		if m.restartPending.Swap(false) || m.lifecycle.Err() != nil {
+			m.terminateLocked(context.WithoutCancel(ctx), "restart or removal")
 		}
 	}
 }
