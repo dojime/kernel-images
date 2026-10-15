@@ -689,6 +689,30 @@ func runBrowserReplExecutorCases(t *testing.T, ctx context.Context, client *inst
 	tabs := run("", `repl.write(JSON.stringify((await listTabs()).map((tab) => tab.targetId)));`)
 	require.NotContains(t, replJSONWrite(t, tabs), reopened.Tab.TargetId, "deleting an executor closes its tab")
 	require.NotContains(t, replJSONWrite(t, tabs), blank.Tab.TargetId)
+
+	moved := run("d", `repl.write(JSON.stringify(await newTab()));`)
+	require.Equal(t, replJSONWrite(t, moved), moved.Tab.TargetId, "tab reports the attached tab")
+	require.True(t, moved.Tab.Created, "the API opened the executor's tab for this call")
+	require.Equal(t, "data:text/html,<title>default</title>", activeURL(), "newTab in a named executor must not change the active tab")
+
+	closedName := "e"
+	closed := executeBrowserRepl(t, ctx, client, instanceoapi.ExecuteBrowserReplJSONRequestBody{
+		Code:     `await ensureRealTab(); await closeTab(); await pageInfo();`,
+		Executor: &closedName,
+	})
+	require.False(t, closed.Success, "a named executor must not fall back to another tab")
+	require.Contains(t, replError(closed), "tab was closed")
+	require.Equal(t, "data:text/html,<title>default</title>", activeURL())
+	recovered := run("e", `repl.write(JSON.stringify((await pageInfo()).url));`)
+	require.Equal(t, "about:blank", replJSONWrite(t, recovered))
+	require.True(t, recovered.Tab.Created)
+
+	for _, name := range []string{"d", "e"} {
+		del, err := client.DeleteBrowserReplExecutorWithResponse(ctx, name, nil)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNoContent, del.StatusCode(), "body=%s", del.Body)
+	}
+	run("", fmt.Sprintf(`await closeTab(%q);`, replJSONWrite(t, moved)))
 }
 
 func runBrowserReplTimeoutCases(t *testing.T, ctx context.Context, client *instanceoapi.ClientWithResponses) {

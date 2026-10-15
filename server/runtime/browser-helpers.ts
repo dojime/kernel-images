@@ -631,6 +631,7 @@ export class BrowserHelpers {
     await this.client.ensureConnected();
     const created = await this.client.browserCommand<{ targetId: string }>('Target.createTarget', {
       url: 'about:blank',
+      background: this.client.homeTargetId !== null,
     });
     await this.client.attach(created.targetId);
     if (url !== 'about:blank') {

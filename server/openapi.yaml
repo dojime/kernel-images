@@ -7849,7 +7849,9 @@ components:
       additionalProperties: false
     BrowserReplTab:
       type: object
-      description: The tab the executor's runtime is attached to after the call.
+      description: |
+        The tab the executor's runtime is attached to after the call. When nothing is attached
+        and the API opened the executor's tab for this call, that tab.
       required: [target_id, created]
       properties:
         target_id:

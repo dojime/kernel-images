@@ -18,15 +18,24 @@ import (
 )
 
 // fakeReplExecutorTabs records the tabs the API opens and closes for named
-// executors.
+// executors. When gate is set, Open signals opening and waits for a value from
+// gate: true opens the tab, false fails.
 type fakeReplExecutorTabs struct {
-	mu     sync.Mutex
-	n      int
-	open   map[string]bool
-	closed []string
+	mu      sync.Mutex
+	n       int
+	open    map[string]bool
+	closed  []string
+	gate    chan bool
+	opening chan struct{}
 }
 
 func (f *fakeReplExecutorTabs) Open(context.Context) (string, error) {
+	if f.gate != nil {
+		f.opening <- struct{}{}
+		if !<-f.gate {
+			return "", fmt.Errorf("open failed")
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
@@ -332,6 +341,73 @@ func TestBrowserReplExecutorsShutdown(t *testing.T) {
 		Body: &oapi.ExecuteBrowserReplJSONRequestBody{Code: "1", Executor: &name},
 	})
 	assert.ErrorIs(t, err, errBrowserReplExecutorsShutDown)
+}
+
+func TestBrowserReplExecutorInvalidFirstCallsDoNotHoldSlots(t *testing.T) {
+	svc, _ := newBrowserReplExecutorsSvc(t)
+	for i := range maxBrowserReplExecutors + 1 {
+		name := fmt.Sprintf("e%d", i)
+		resp, err := svc.ExecuteBrowserRepl(context.Background(), oapi.ExecuteBrowserReplRequestObject{
+			Body: &oapi.ExecuteBrowserReplJSONRequestBody{Code: "", Executor: &name},
+		})
+		require.NoError(t, err)
+		assert.IsType(t, oapi.ExecuteBrowserRepl400JSONResponse{}, resp)
+	}
+	assert.Len(t, svc.browserReplExecutors.list(), 1)
+	assert.True(t, execOn(t, svc, "valid", "1", 0).Success)
+}
+
+func TestBrowserReplExecutorFailedFirstCallKeepsQueuedCall(t *testing.T) {
+	svc, tabs := newBrowserReplExecutorsSvc(t)
+	tabs.gate = make(chan bool)
+	tabs.opening = make(chan struct{}, 2)
+
+	first := make(chan oapi.ExecuteBrowserReplResponseObject, 1)
+	second := make(chan oapi.ExecuteBrowserRepl200JSONResponse, 1)
+	name := "a"
+	go func() {
+		resp, err := svc.ExecuteBrowserRepl(context.Background(), oapi.ExecuteBrowserReplRequestObject{
+			Body: &oapi.ExecuteBrowserReplJSONRequestBody{Code: "1", Executor: &name},
+		})
+		assert.NoError(t, err)
+		first <- resp
+	}()
+	<-tabs.opening
+	go func() { second <- execOn(t, svc, "a", "repl.write(JSON.stringify(1))", 0) }()
+	time.Sleep(100 * time.Millisecond)
+
+	tabs.gate <- false
+	assert.IsType(t, oapi.ExecuteBrowserRepl500JSONResponse{}, <-first)
+	<-tabs.opening
+	tabs.gate <- true
+	assert.Equal(t, float64(1), written(t, <-second), "a queued call must survive another call's failed start")
+	assert.Len(t, svc.browserReplExecutors.list(), 2)
+}
+
+func TestBrowserReplExecutorDeleteDuringTabOpen(t *testing.T) {
+	svc, tabs := newBrowserReplExecutorsSvc(t)
+	tabs.gate = make(chan bool)
+	tabs.opening = make(chan struct{}, 1)
+
+	result := make(chan oapi.ExecuteBrowserRepl200JSONResponse, 1)
+	go func() { result <- execOn(t, svc, "a", "1", 0) }()
+	<-tabs.opening
+
+	deleted := make(chan struct{})
+	go func() {
+		_, err := svc.DeleteBrowserReplExecutor(context.Background(), oapi.DeleteBrowserReplExecutorRequestObject{Name: "a"})
+		assert.NoError(t, err)
+		close(deleted)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	tabs.gate <- true
+
+	resp := <-result
+	assert.False(t, resp.Success)
+	require.NotNil(t, resp.Error)
+	assert.Contains(t, *resp.Error, "executor was deleted")
+	<-deleted
+	assert.Empty(t, tabs.open, "the tab opened while the executor was being deleted is closed")
 }
 
 func TestHeapLimitWatcher(t *testing.T) {

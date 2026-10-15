@@ -717,7 +717,13 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 	m.busy = true
 	m.lastUsedAt = time.Now()
 	m.cancelCurrent = cancelOperation
+	// restart sets restartPending and reads cancelCurrent under infoMu, so it
+	// either cancels this call or leaves the restart for this call to apply.
+	restartPending := m.restartPending.Swap(false)
 	m.infoMu.Unlock()
+	if restartPending {
+		m.terminateLocked(ctx, "restart")
+	}
 	defer func() {
 		m.infoMu.Lock()
 		m.busy = false
@@ -789,6 +795,9 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 
 	newState, err := m.ensureLocked(ctx)
 	if err != nil {
+		if cause := browserReplInterruption(ctx); cause != nil {
+			return nil, cause
+		}
 		log.Error("failed to start browser REPL", "error", err)
 		return oapi.ExecuteBrowserRepl500JSONResponse{
 			InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
@@ -800,6 +809,9 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 
 	homeTargetID, tabCreated, err := m.ensureTab(ctx)
 	if err != nil {
+		if cause := browserReplInterruption(ctx); cause != nil {
+			return nil, cause
+		}
 		log.Error("failed to open executor tab", "error", err)
 		return oapi.ExecuteBrowserRepl500JSONResponse{
 			InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
@@ -827,6 +839,9 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 		// The executor's tab was closed and nothing is attached. The child
 		// answered without running the code, so send it again with a new tab.
 		if homeTargetID, err = m.openTab(ctx); err != nil {
+			if cause := browserReplInterruption(ctx); cause != nil {
+				return nil, cause
+			}
 			log.Error("failed to reopen executor tab", "error", err)
 			return oapi.ExecuteBrowserRepl500JSONResponse{
 				InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
@@ -876,11 +891,12 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 		return browserReplTerminatedResponse(replID, newState, err, int(time.Since(execStart).Milliseconds())), nil
 	}
 	mapped.NewState = newState
-	if resp.TargetID != "" {
-		mapped.Tab = &oapi.BrowserReplTab{
-			TargetId: resp.TargetID,
-			Created:  tabCreated && resp.TargetID == homeTargetID,
-		}
+	attached := resp.TargetID
+	if attached == "" && tabCreated {
+		attached = homeTargetID
+	}
+	if attached != "" {
+		mapped.Tab = &oapi.BrowserReplTab{TargetId: attached, Created: tabCreated}
 	}
 
 	if resp.TimedOut || resp.Exiting {
@@ -907,6 +923,17 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 		mapped.ReplTerminated = &terminated
 	}
 	return mapped, nil
+}
+
+// browserReplInterruption returns the delete or restart that ended a call, if
+// one did. Such calls fail like calls interrupted while queued, not as REPL
+// start failures.
+func browserReplInterruption(ctx context.Context) error {
+	cause := context.Cause(ctx)
+	if errors.Is(cause, errBrowserReplDeleted) || errors.Is(cause, errBrowserReplRestarted) {
+		return cause
+	}
+	return nil
 }
 
 type browserReplRequestTooLargeError struct {
@@ -946,10 +973,11 @@ func (m *browserReplManager) ensureTab(ctx context.Context) (string, bool, error
 }
 
 // openTab opens a new tab for a named executor and records it before any
-// child uses it, so DELETE and shutdown can always close it. The caller must
-// hold admission.
+// child uses it, so DELETE and shutdown can always close it. A delete or
+// restart does not cancel the open, so a tab Chromium creates is always
+// recorded. The caller must hold admission.
 func (m *browserReplManager) openTab(ctx context.Context) (string, error) {
-	targetID, err := m.tabs.Open(ctx)
+	targetID, err := m.tabs.Open(context.WithoutCancel(ctx))
 	if err != nil {
 		return "", fmt.Errorf("failed to open executor tab: %w", err)
 	}
@@ -963,8 +991,8 @@ func (m *browserReplManager) openTab(ctx context.Context) (string, error) {
 // calls: the call running on it fails, and the next admitted call starts a
 // fresh child.
 func (m *browserReplManager) restart(ctx context.Context) {
-	m.restartPending.Store(true)
 	m.infoMu.Lock()
+	m.restartPending.Store(true)
 	cancel := m.cancelCurrent
 	m.infoMu.Unlock()
 	if cancel != nil {

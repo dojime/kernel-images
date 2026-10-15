@@ -70,6 +70,9 @@ type browserReplExecutors struct {
 	mu     sync.Mutex
 	named  map[string]*browserReplManager
 	closed bool
+	// users counts the calls holding each named executor, so one that never
+	// got a tab is dropped only once no call can still be starting it.
+	users map[*browserReplManager]int
 }
 
 func newBrowserReplExecutors(def *browserReplManager, tabs executorTabs) *browserReplExecutors {
@@ -77,10 +80,12 @@ func newBrowserReplExecutors(def *browserReplManager, tabs executorTabs) *browse
 		def:   def,
 		tabs:  tabs,
 		named: make(map[string]*browserReplManager),
+		users: make(map[*browserReplManager]int),
 	}
 }
 
-// executorFor returns the named executor, creating it if there is room.
+// executorFor returns the named executor, creating it if there is room. The
+// caller must pass a named executor to done once its call returns.
 func (x *browserReplExecutors) executorFor(name string) (*browserReplManager, error) {
 	if name == defaultBrowserReplExecutor {
 		return x.def, nil
@@ -91,6 +96,7 @@ func (x *browserReplExecutors) executorFor(name string) (*browserReplManager, er
 		return nil, errBrowserReplExecutorsShutDown
 	}
 	if m, ok := x.named[name]; ok {
+		x.users[m]++
 		return m, nil
 	}
 	if len(x.named) >= maxBrowserReplExecutors {
@@ -101,7 +107,31 @@ func (x *browserReplExecutors) executorFor(name string) (*browserReplManager, er
 	socket := filepath.Join(filepath.Dir(browserReplSocketPath()), "browser-repl-"+uuid.NewString()+".sock")
 	m := newNamedBrowserReplManager(name, socket, x.tabs)
 	x.named[name] = m
+	x.users[m] = 1
 	return m, nil
+}
+
+// done ends a call's hold on a named executor. An executor that never got a
+// tab (its first calls failed validation or could not start) has no state
+// worth keeping, so the last call to release it drops it, freeing its slot.
+func (x *browserReplExecutors) done(ctx context.Context, m *browserReplManager) {
+	if m.isDefault() {
+		return
+	}
+	x.mu.Lock()
+	x.users[m]--
+	drop := x.users[m] == 0 && x.named[m.name] == m && m.info().targetID == ""
+	if x.users[m] == 0 {
+		delete(x.users, m)
+	}
+	if drop {
+		delete(x.named, m.name)
+	}
+	x.mu.Unlock()
+	if drop {
+		// No call holds the executor, so retiring cannot wait on admission.
+		m.retire(context.WithoutCancel(ctx), errBrowserReplDeleted)
+	}
 }
 
 // remove drops m if it is still the executor registered under its name, and
@@ -150,18 +180,27 @@ func (x *browserReplExecutors) Shutdown(ctx context.Context) {
 
 	// Retiring and closing get separate budgets, so slow process exits cannot
 	// use up the time needed to close the tabs they leave behind.
+	// Executors retire concurrently so one slow process exit cannot use up
+	// the others' budget.
 	retireCtx, cancelRetire := context.WithTimeout(ctx, browserReplExecutorShutdownGrace)
 	defer cancelRetire()
-	targetIDs := make([]string, 0, len(named))
-	for _, m := range named {
-		if targetID := m.retire(retireCtx, errBrowserReplExecutorsShutDown); targetID != "" {
-			targetIDs = append(targetIDs, targetID)
-		}
+	targetIDs := make([]string, len(named))
+	var wg sync.WaitGroup
+	for i, m := range named {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			targetIDs[i] = m.retire(retireCtx, errBrowserReplExecutorsShutDown)
+		}()
 	}
+	wg.Wait()
 
 	closeCtx, cancelClose := context.WithTimeout(ctx, browserReplExecutorShutdownGrace)
 	defer cancelClose()
 	for _, targetID := range targetIDs {
+		if targetID == "" {
+			continue
+		}
 		if err := x.tabs.Close(closeCtx, targetID); err != nil {
 			logger.FromContext(ctx).Warn("failed to close browser REPL executor tab", "target_id", targetID, "error", err)
 		}
@@ -193,6 +232,7 @@ func (s *ApiService) ExecuteBrowserRepl(ctx context.Context, request oapi.Execut
 	if err != nil {
 		return nil, err
 	}
+	defer s.browserReplExecutors.done(ctx, m)
 
 	resp, err := m.Execute(ctx, request)
 	if errors.Is(err, errBrowserReplDeleted) || errors.Is(err, errBrowserReplRestarted) {
@@ -203,13 +243,6 @@ func (s *ApiService) ExecuteBrowserRepl(ctx context.Context, request oapi.Execut
 			Success: false,
 			Error:   &message,
 		}, nil
-	}
-	if _, failed := resp.(oapi.ExecuteBrowserRepl500JSONResponse); failed && !m.isDefault() && m.info().targetID == "" {
-		// A named executor that never got a tab has no state worth keeping;
-		// drop it so it does not hold one of the limited slots.
-		if s.browserReplExecutors.remove(m) {
-			m.retire(ctx, errBrowserReplDeleted)
-		}
 	}
 	return resp, err
 }
