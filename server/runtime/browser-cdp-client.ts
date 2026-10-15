@@ -142,6 +142,11 @@ export class BrowserReplCdpClient {
 
   sessionId: string | null = null;
   targetId: string | null = null;
+  // A named executor's own tab, opened by the API. When set, attaching falls
+  // back to it instead of another page, and attaching does not make a tab
+  // active, so the executor never takes the foreground tab from the live view
+  // or the default executor.
+  homeTargetId: string | null = null;
 
   // Modal JavaScript dialogs need explicit state because they can freeze
   // renderer-routed commands while their Page.javascriptDialogOpening/Closed
@@ -507,7 +512,7 @@ export class BrowserReplCdpClient {
     }));
   }
 
-  async attach(targetId: string, {activate = true}: {activate?: boolean} = {}): Promise<string> {
+  async attach(targetId: string, {activate = this.homeTargetId === null}: {activate?: boolean} = {}): Promise<string> {
     await this.ensureConnected();
     if (this.targetId === targetId && this.sessionId) {
       return this.sessionId;
@@ -617,6 +622,7 @@ export class BrowserReplCdpClient {
       const pages = targets.filter((t) => t.type === 'page');
       const pick =
         pages.find((t) => t.targetId === this.targetId) ??
+        pages.find((t) => t.targetId === this.homeTargetId) ??
         pages.find((t) => !isInternalUrl(t.url)) ??
         pages[0];
       if (!pick) {
@@ -691,8 +697,13 @@ export class BrowserReplCdpClient {
     await this.ensureAttached();
     const targets = await this.listTargets();
     const current = targets.find((t) => t.targetId === this.targetId);
-    if (current && current.type === 'page' && !isInternalUrl(current.url)) {
+    if (current && current.type === 'page' && (!isInternalUrl(current.url) || current.targetId === this.homeTargetId)) {
       return current;
+    }
+    const home = targets.find((t) => t.type === 'page' && t.targetId === this.homeTargetId);
+    if (home) {
+      await this.attach(home.targetId);
+      return home;
     }
     const real = targets.find((t) => t.type === 'page' && !isInternalUrl(t.url));
     if (real) {
@@ -713,6 +724,16 @@ export class BrowserReplCdpClient {
         attached: true,
       }
     );
+  }
+
+  async targetExists(targetId: string): Promise<boolean> {
+    await this.ensureConnected();
+    try {
+      await this.browserCommand('Target.getTargetInfo', { targetId });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async evaluateOnTarget<T = any>(targetId: string, expression: string): Promise<T> {

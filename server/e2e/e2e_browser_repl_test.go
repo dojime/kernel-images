@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
 	instanceoapi "github.com/kernel/kernel-images/server/lib/oapi"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -605,7 +607,88 @@ func runBrowserReplAPI(t *testing.T, image string) {
 		require.Equal(t, "undefined", replJSONWrite(t, r2), "reset must clear prior bindings")
 	})
 
+	t.Run("named executors", func(t *testing.T) {
+		runBrowserReplExecutorCases(t, ctx, client)
+	})
+
 	runBrowserReplTimeoutCases(t, ctx, client)
+}
+
+func runBrowserReplExecutorCases(t *testing.T, ctx context.Context, client *instanceoapi.ClientWithResponses) {
+	run := func(executor, code string) *instanceoapi.BrowserReplResult {
+		t.Helper()
+		body := instanceoapi.ExecuteBrowserReplJSONRequestBody{Code: code}
+		if executor != "" {
+			body.Executor = &executor
+		}
+		r := executeBrowserRepl(t, ctx, client, body)
+		require.True(t, r.Success, "executor %q: %s", executor, replError(r))
+		return r
+	}
+	activeURL := func() any {
+		t.Helper()
+		rsp, err := client.ExecutePlaywrightCodeWithResponse(ctx, instanceoapi.ExecutePlaywrightCodeJSONRequestBody{Code: `return page.url();`})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.JSON200, "body=%s", rsp.Body)
+		return rsp.JSON200.Result
+	}
+
+	run("", `await ensureRealTab(); await gotoUrl("data:text/html,<title>default</title>"); await waitForLoad();`)
+	require.Equal(t, "data:text/html,<title>default</title>", activeURL())
+
+	first := run("a", `await gotoUrl("data:text/html,<title>a</title>"); await waitForLoad(); repl.write(JSON.stringify((await pageInfo()).title));`)
+	require.Equal(t, "a", replJSONWrite(t, first))
+	require.True(t, first.NewState)
+	require.NotNil(t, first.Tab)
+	require.True(t, first.Tab.Created)
+	require.Equal(t, "data:text/html,<title>default</title>", activeURL(), "a named executor must not change the active tab")
+
+	again := run("a", `repl.write(JSON.stringify((await pageInfo()).title));`)
+	require.Equal(t, "a", replJSONWrite(t, again))
+	require.False(t, again.NewState)
+	require.Equal(t, first.Tab.TargetId, again.Tab.TargetId)
+	require.False(t, again.Tab.Created)
+	require.Equal(t, "default", replJSONWrite(t, run("", `repl.write(JSON.stringify((await pageInfo()).title));`)))
+
+	blank := run("c", `repl.write(JSON.stringify((await ensureRealTab()).targetId));`)
+	require.Equal(t, blank.Tab.TargetId, replJSONWrite(t, blank), "ensureRealTab keeps a named executor on its own blank tab")
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, name := range []string{"a", "c"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			body := instanceoapi.ExecuteBrowserReplJSONRequestBody{Code: `await waitMs(2000);`, Executor: &name}
+			rsp, err := client.ExecuteBrowserReplWithResponse(ctx, body)
+			assert.NoError(t, err)
+			assert.True(t, rsp.JSON200 != nil && rsp.JSON200.Success, "executor %s: %s", name, rsp.Body)
+		}()
+	}
+	wg.Wait()
+	require.Less(t, time.Since(start), 3500*time.Millisecond, "calls on different executors should overlap")
+
+	run("", fmt.Sprintf(`await closeTab(%q);`, first.Tab.TargetId))
+	reopened := run("a", `repl.write(JSON.stringify((await pageInfo()).url));`)
+	require.Equal(t, "about:blank", replJSONWrite(t, reopened))
+	require.True(t, reopened.Tab.Created, "a closed executor tab is reopened")
+	require.NotEqual(t, first.Tab.TargetId, reopened.Tab.TargetId)
+	require.False(t, reopened.NewState, "reopening the tab keeps the executor's state")
+
+	list, err := client.ListBrowserReplExecutorsWithResponse(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, list.JSON200)
+	require.Len(t, list.JSON200.Executors, 3)
+	require.Equal(t, "default", list.JSON200.Executors[0].Name)
+
+	for _, name := range []string{"a", "c"} {
+		del, err := client.DeleteBrowserReplExecutorWithResponse(ctx, name, nil)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusNoContent, del.StatusCode(), "body=%s", del.Body)
+	}
+	tabs := run("", `repl.write(JSON.stringify((await listTabs()).map((tab) => tab.targetId)));`)
+	require.NotContains(t, replJSONWrite(t, tabs), reopened.Tab.TargetId, "deleting an executor closes its tab")
+	require.NotContains(t, replJSONWrite(t, tabs), blank.Tab.TargetId)
 }
 
 func runBrowserReplTimeoutCases(t *testing.T, ctx context.Context, client *instanceoapi.ClientWithResponses) {

@@ -195,11 +195,11 @@ func (m *browserReplManager) executeCustomWebMCPCodeRequest(ctx context.Context,
 	}
 	ctx = operationCtx
 
-	request, err := prepareBrowserReplRequest(code, timeout)
+	request, err := prepareBrowserReplRequest(code, timeout, "")
 	if err != nil {
 		return nil, &customWebMCPExecutionError{message: err.Error()}
 	}
-	if err := m.ensureLocked(ctx); err != nil {
+	if _, err := m.ensureLocked(ctx); err != nil {
 		return nil, &browserReplNotDispatchedError{cause: fmt.Errorf("start Browser REPL: %w", err)}
 	}
 	replID := m.child.id
@@ -213,7 +213,7 @@ func (m *browserReplManager) executeCustomWebMCPCodeRequest(ctx context.Context,
 				return nil, &browserReplNotDispatchedError{cause: context.DeadlineExceeded}
 			}
 			timeout = remaining + browserReplResponseGrace
-			request, err = prepareBrowserReplRequest(code, timeout)
+			request, err = prepareBrowserReplRequest(code, timeout, "")
 			if err != nil {
 				return nil, &customWebMCPExecutionError{message: err.Error()}
 			}

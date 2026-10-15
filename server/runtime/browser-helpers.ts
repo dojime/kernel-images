@@ -658,6 +658,10 @@ export class BrowserHelpers {
   };
 
   ensureRealTab = async (): Promise<Record<string, unknown> | null> => {
+    if (this.client.homeTargetId !== null) {
+      const tab = await this.client.ensureRealTab();
+      return { targetId: tab.targetId, url: tab.url, title: tab.title };
+    }
     const tabs = await this.listTabs(false);
     if (tabs.length === 0) return null;
     try {
