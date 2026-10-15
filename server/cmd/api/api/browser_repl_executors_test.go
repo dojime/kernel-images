@@ -422,6 +422,29 @@ func testBrowserReplExecutorDeleteDuringTabOpen(t *testing.T, body oapi.ExecuteB
 	assert.Empty(t, tabs.open, "the tab opened while the executor was being deleted is closed")
 }
 
+func TestBrowserReplExecutorsShutdownClosesTabOpenedAfterRetireBudget(t *testing.T) {
+	svc, tabs := newBrowserReplExecutorsSvc(t)
+	tabs.gate = make(chan bool)
+	tabs.opening = make(chan struct{}, 1)
+
+	result := make(chan oapi.ExecuteBrowserReplResponseObject, 1)
+	go func() {
+		name := "a"
+		resp, _ := svc.ExecuteBrowserRepl(context.Background(), oapi.ExecuteBrowserReplRequestObject{
+			Body: &oapi.ExecuteBrowserReplJSONRequestBody{Code: "1", Executor: &name},
+		})
+		result <- resp
+	}()
+	<-tabs.opening
+
+	// Shutdown gives up waiting for the call after its retire budget, while
+	// the tab is still opening.
+	svc.browserReplExecutors.Shutdown(context.Background())
+	tabs.gate <- true
+	<-result
+	assert.Empty(t, tabs.open, "a tab that finishes opening after shutdown is closed")
+}
+
 func TestHeapLimitWatcher(t *testing.T) {
 	var out, logs bytes.Buffer
 	w := newHeapLimitWatcher(&out, slog.New(slog.NewTextHandler(&logs, nil)), "a", "512")

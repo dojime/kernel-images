@@ -528,8 +528,9 @@ async function executeRequest(
     try {
       homeExists = attachedTargetId() !== undefined || await cdpClient.targetExists(request.home_target_id);
     } catch {
-      // The browser is unreachable. Run the cell anyway: browser helpers
-      // report the failure, and cells that do not use the browser still work.
+      // The browser is unreachable or the check failed. Run the cell anyway:
+      // browser helpers report a failure, and cells that do not use the
+      // browser still work.
     }
     if (!homeExists) {
       return {

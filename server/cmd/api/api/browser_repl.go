@@ -988,6 +988,14 @@ func (m *browserReplManager) openTab(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to open executor tab: %w", err)
 	}
+	if cause := context.Cause(m.lifecycle); cause != nil {
+		// The executor was removed while the tab opened, and its retire may
+		// already have stopped waiting for this call; close the tab here.
+		if err := m.tabs.Close(context.WithoutCancel(ctx), targetID); err != nil {
+			logger.FromContext(ctx).Warn("failed to close executor tab", "executor", m.name, "target_id", targetID, "error", err)
+		}
+		return "", cause
+	}
 	m.infoMu.Lock()
 	m.homeTargetID = targetID
 	m.infoMu.Unlock()

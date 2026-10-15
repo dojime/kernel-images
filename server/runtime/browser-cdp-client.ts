@@ -733,13 +733,17 @@ export class BrowserReplCdpClient {
     );
   }
 
+  // Reports whether a target exists. Only Chromium's "no such target" answer
+  // means it does not; any other failure is thrown, so a transient error is
+  // never mistaken for a closed tab.
   async targetExists(targetId: string): Promise<boolean> {
     await this.ensureConnected();
     try {
       await this.browserCommand('Target.getTargetInfo', { targetId });
       return true;
-    } catch {
-      return false;
+    } catch (err: any) {
+      if (String(err?.message ?? err).includes('No target with given id')) return false;
+      throw err;
     }
   }
 
