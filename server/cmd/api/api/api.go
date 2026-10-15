@@ -20,6 +20,7 @@ import (
 	"github.com/kernel/kernel-images/server/lib/recorder"
 	"github.com/kernel/kernel-images/server/lib/scaletozero"
 	"github.com/kernel/kernel-images/server/lib/telemetry"
+	"github.com/kernel/kernel-images/server/lib/webauthnhook"
 	"github.com/kernel/kernel-images/server/lib/webmcpclient"
 )
 
@@ -143,6 +144,10 @@ type ApiService struct {
 	// decide whether to refuse a context that would set its own proxy.
 	egressPolicy *egresspolicy.State
 
+	// webauthnHook answers pages' WebAuthn calls over its own DevTools
+	// connection; PUT /webauthn/hook turns it on and off.
+	webauthnHook *webauthnhook.Hook
+
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 }
@@ -161,6 +166,7 @@ func New(
 	otlpExport OTLPExporter,
 	s2Storage S2Storage,
 	egressPolicy *egresspolicy.State,
+	webauthnHook *webauthnhook.Hook,
 	processOutputConfig ProcessOutputConfig,
 ) (*ApiService, error) {
 	switch {
@@ -178,6 +184,8 @@ func New(
 		return nil, fmt.Errorf("eventStream cannot be nil")
 	case egressPolicy == nil:
 		return nil, fmt.Errorf("egressPolicy cannot be nil")
+	case webauthnHook == nil:
+		return nil, fmt.Errorf("webauthnHook cannot be nil")
 	}
 
 	outputBudget, err := newProcessOutputBudget(processOutputConfig)
@@ -206,6 +214,7 @@ func New(
 		otlpExport:        otlpExport,
 		s2Storage:         s2Storage,
 		egressPolicy:      egressPolicy,
+		webauthnHook:      webauthnHook,
 		webmcp:            webmcpclient.NewManager(upstreamMgr),
 		browserRepl:       newBrowserReplManager(),
 		lifecycleCtx:      ctx,
@@ -489,6 +498,7 @@ func (s *ApiService) Shutdown(ctx context.Context) error {
 	s.playwrightExecutors.Shutdown(ctx)
 
 	_ = s.webmcp.Close()
+	s.webauthnHook.Stop()
 	s.monitorMu.Lock()
 	s.cdpMonitor.Stop()
 	s.telemetrySession.Stop()
