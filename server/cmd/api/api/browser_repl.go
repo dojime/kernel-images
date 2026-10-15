@@ -713,30 +713,8 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 	defer m.release()
 
 	operationCtx, cancelOperation, stopPropagation := m.operationContext(ctx)
-	m.infoMu.Lock()
-	m.busy = true
-	m.lastUsedAt = time.Now()
-	m.cancelCurrent = cancelOperation
-	// restart sets restartPending and reads cancelCurrent under infoMu, so it
-	// either cancels this call or leaves the restart for this call to apply.
-	restartPending := m.restartPending.Swap(false)
-	m.infoMu.Unlock()
-	if restartPending {
-		m.terminateLocked(ctx, "restart")
-	}
-	defer func() {
-		m.infoMu.Lock()
-		m.busy = false
-		m.cancelCurrent = nil
-		m.infoMu.Unlock()
-		stopPropagation()
-		cancelOperation(nil)
-		// A restart that arrived during this call replaces the child now,
-		// not when the next call is admitted.
-		if m.restartPending.Swap(false) {
-			m.terminateLocked(context.WithoutCancel(ctx), "restart")
-		}
-	}()
+	defer stopPropagation()
+	defer m.beginOperation(ctx, cancelOperation)()
 	if err := context.Cause(operationCtx); err != nil {
 		return nil, err
 	}
@@ -808,10 +786,10 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 	replID := m.child.id
 
 	homeTargetID, tabCreated, err := m.ensureTab(ctx)
+	if cause := browserReplInterruption(ctx); cause != nil {
+		return nil, cause
+	}
 	if err != nil {
-		if cause := browserReplInterruption(ctx); cause != nil {
-			return nil, cause
-		}
 		log.Error("failed to open executor tab", "error", err)
 		return oapi.ExecuteBrowserRepl500JSONResponse{
 			InternalErrorJSONResponse: oapi.InternalErrorJSONResponse{
@@ -923,6 +901,35 @@ func (m *browserReplManager) Execute(ctx context.Context, request oapi.ExecuteBr
 		mapped.ReplTerminated = &terminated
 	}
 	return mapped, nil
+}
+
+// beginOperation marks an admitted operation as the executor's current one,
+// so restart can interrupt it, and returns the function that ends it. A
+// restart that arrived before the operation registered, or while it ran,
+// replaces the child. The caller must hold admission until the returned
+// function has run.
+func (m *browserReplManager) beginOperation(ctx context.Context, cancel context.CancelCauseFunc) func() {
+	m.infoMu.Lock()
+	m.busy = true
+	m.lastUsedAt = time.Now()
+	m.cancelCurrent = cancel
+	// restart sets restartPending and reads cancelCurrent under infoMu, so it
+	// either cancels this operation or leaves the restart for it to apply.
+	restartPending := m.restartPending.Swap(false)
+	m.infoMu.Unlock()
+	if restartPending {
+		m.terminateLocked(ctx, "restart")
+	}
+	return func() {
+		m.infoMu.Lock()
+		m.busy = false
+		m.cancelCurrent = nil
+		m.infoMu.Unlock()
+		cancel(nil)
+		if m.restartPending.Swap(false) {
+			m.terminateLocked(context.WithoutCancel(ctx), "restart")
+		}
+	}
 }
 
 // browserReplInterruption returns the delete or restart that ended a call, if

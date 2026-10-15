@@ -186,10 +186,8 @@ func (m *browserReplManager) executeCustomWebMCPCodeRequest(ctx context.Context,
 	defer m.release()
 
 	operationCtx, cancelOperation, stopPropagation := m.operationContext(ctx)
-	defer func() {
-		stopPropagation()
-		cancelOperation(nil)
-	}()
+	defer stopPropagation()
+	defer m.beginOperation(ctx, cancelOperation)()
 	if err := context.Cause(operationCtx); err != nil {
 		return nil, &browserReplNotDispatchedError{cause: err}
 	}

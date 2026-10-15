@@ -308,7 +308,7 @@ func TestBrowserReplExecutorRestartIdleDefault(t *testing.T) {
 
 func TestBrowserReplNamedExecutorRejectsCustomTools(t *testing.T) {
 	svc, _ := newBrowserReplExecutorsSvc(t)
-	resp := execOn(t, svc, "a", `await webmcp.listCustomTools()`, 0)
+	resp := execOn(t, svc, "a", `webmcp.listCustomTools();`, 0)
 	assert.False(t, resp.Success)
 	require.NotNil(t, resp.Error)
 	assert.Contains(t, *resp.Error, "only available in the default executor")
@@ -385,12 +385,24 @@ func TestBrowserReplExecutorFailedFirstCallKeepsQueuedCall(t *testing.T) {
 }
 
 func TestBrowserReplExecutorDeleteDuringTabOpen(t *testing.T) {
+	for _, body := range []oapi.ExecuteBrowserReplJSONRequestBody{
+		{Code: "1"},
+		{Code: "", Reset: ptrTo(true)},
+	} {
+		t.Run(fmt.Sprintf("reset=%v", body.Reset != nil), func(t *testing.T) {
+			testBrowserReplExecutorDeleteDuringTabOpen(t, body)
+		})
+	}
+}
+
+func testBrowserReplExecutorDeleteDuringTabOpen(t *testing.T, body oapi.ExecuteBrowserReplJSONRequestBody) {
 	svc, tabs := newBrowserReplExecutorsSvc(t)
 	tabs.gate = make(chan bool)
 	tabs.opening = make(chan struct{}, 1)
 
+	body.Executor = ptrTo("a")
 	result := make(chan oapi.ExecuteBrowserRepl200JSONResponse, 1)
-	go func() { result <- execOn(t, svc, "a", "1", 0) }()
+	go func() { result <- executeBrowserRepl(t, svc, &body) }()
 	<-tabs.opening
 
 	deleted := make(chan struct{})

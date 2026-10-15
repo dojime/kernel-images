@@ -352,7 +352,9 @@ if (customToolRegistry) {
   publishCustomTools([]);
   customToolRegistry.setErrorHandler((message) => process.stderr.write(`[custom-webmcp] ${message}\n`));
 }
-const customToolsUnavailable = async (): Promise<never> => {
+// Throws synchronously so a call fails the cell even when it is not awaited,
+// as the synchronous listCustomTools would on the default executor.
+const customToolsUnavailable = (): never => {
   throw new Error(`custom WebMCP tools are only available in the default executor; this is executor "${EXECUTOR}"`);
 };
 let nativeToolRefs = new Set<string>();

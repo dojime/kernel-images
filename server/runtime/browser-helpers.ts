@@ -614,8 +614,13 @@ export class BrowserHelpers {
   };
 
   newTab = async (url = 'about:blank'): Promise<string> => {
-    if (url !== 'about:blank') {
-      const current = await this.currentTab();
+    // A named executor whose tab was closed has no current tab; open a new
+    // one instead of failing.
+    const current = url === 'about:blank' ? null : await this.currentTab().catch((err) => {
+      if (this.client.homeTargetId === null) throw err;
+      return null;
+    });
+    if (current) {
       const currentUrl = String(current.url ?? '');
       if (
         currentUrl === '' ||

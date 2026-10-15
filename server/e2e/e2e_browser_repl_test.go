@@ -707,12 +707,18 @@ func runBrowserReplExecutorCases(t *testing.T, ctx context.Context, client *inst
 	require.Equal(t, "about:blank", replJSONWrite(t, recovered))
 	require.True(t, recovered.Tab.Created)
 
-	for _, name := range []string{"d", "e"} {
+	escaped := run("f", `await ensureRealTab(); await closeTab(); const id = await newTab("data:text/html,<title>f</title>"); repl.write(JSON.stringify(id));`)
+	require.Equal(t, replJSONWrite(t, escaped), escaped.Tab.TargetId, "newTab(url) works after the executor's tab is closed")
+	require.Equal(t, "data:text/html,<title>default</title>", activeURL())
+
+	for _, name := range []string{"d", "e", "f"} {
 		del, err := client.DeleteBrowserReplExecutorWithResponse(ctx, name, nil)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusNoContent, del.StatusCode(), "body=%s", del.Body)
 	}
-	run("", fmt.Sprintf(`await closeTab(%q);`, replJSONWrite(t, moved)))
+	for _, leftover := range []any{replJSONWrite(t, moved), replJSONWrite(t, escaped)} {
+		run("", fmt.Sprintf(`await closeTab(%q);`, leftover))
+	}
 }
 
 func runBrowserReplTimeoutCases(t *testing.T, ctx context.Context, client *instanceoapi.ClientWithResponses) {
